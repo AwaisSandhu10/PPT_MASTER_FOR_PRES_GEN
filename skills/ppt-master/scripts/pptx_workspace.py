@@ -32,6 +32,7 @@ from xml.etree import ElementTree as ET
 
 SOURCE_PPTX_PATH = Path("sources/source.pptx")
 NATIVE_STRUCTURE_PATH = Path("analysis/native_structure.json")
+TEMPLATE_CONTEXT_PATH = Path("analysis/template_context.json")
 ROUNDTRIP_MANIFEST_PATH = Path("analysis/roundtrip_manifest.json")
 ROUNDTRIP_PAGE_PLAN_PATH = Path("page_plan.json")
 TEMPLATE_MANIFEST_PATH = Path("analysis/manifest.json")
@@ -227,6 +228,11 @@ def source_pptx_path(workspace: Path) -> Path:
 def native_structure_path(workspace: Path) -> Path:
     """Return the semantic native-structure contract path."""
     return workspace / NATIVE_STRUCTURE_PATH
+
+
+def template_context_path(workspace: Path) -> Path:
+    """Return the generator-facing template context path."""
+    return workspace / TEMPLATE_CONTEXT_PATH
 
 
 def roundtrip_page_plan_path(workspace: Path) -> Path:
@@ -968,6 +974,7 @@ __all__ = [
     "inventory_package_resources",
     "load_roundtrip_manifest",
     "native_structure_path",
+    "template_context_path",
     "reject_removed_workspace_layout",
     "roundtrip_page_plan_path",
     "source_pptx_path",

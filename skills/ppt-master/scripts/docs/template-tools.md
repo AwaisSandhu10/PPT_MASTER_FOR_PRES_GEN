@@ -14,6 +14,7 @@ Produces one import workspace (typically under `/tmp/pptx_template_import/`; an 
 |---|---|
 | `analysis/manifest.json` | Source facts: slide size, theme colors, fonts, per-master theme summaries, resource inventory and asset-name map, placeholder metadata, SVG file paths, per-slide / per-layout / per-master metadata (including source-owned inherited-shape visibility), `pageTypeCandidates` |
 | `analysis/native_structure.json` | Stable Master/Layout keys, picker names, placeholder type/index/geometry, inherited-shape visibility, source hash, source-graph quality facts |
+| `analysis/template_context.json` | Generator-facing typography, text behavior, list structure and approximate capacity per placeholder, for every layout; see [Template context](#template-context) below |
 | `sources/source.pptx` | Byte-preserved backing package for cross-checking and identity validation; never copied into a template |
 | `images/` | PowerPoint image media including SVG/EMF/WMF; SVG `href` values reuse the manifest asset map |
 | `sounds/`, `audio/`, `video/`, `native-payloads/` | Conditional semantic resource directories, created only when populated |
@@ -28,7 +29,83 @@ Produces one import workspace (typically under `/tmp/pptx_template_import/`; an 
 - The projection removes opaque/duplicate/import-only carriers while retaining visible intent, compact frame/preset and structure markers, ids, assets, inline Chart/Table JSON, and per-object source refs. Model-facing page coordinates use at most two decimals; crop/path/matrix values keep required precision. The summary indexes roster and counts; the manifest owns source paths/hashes and initial subtree hashes and never enters model context. After any direct IR edit, refresh the summary: `svg_authoring_view.py "<import_workspace>/authoring-svg" --refresh-summary` (in-place vector/picture normalization refreshes it automatically).
 - The importer generates no narrative summary or SVG-size CSV.
 
+### Placeholder coverage and its boundary
+
+`<p:ph>` is read from every element that may legally host one — `p:sp`, `p:pic`
+and `p:graphicFrame` — so a populated picture, chart or table placeholder is a
+bound slot rather than loose slide content. A placeholder hosted by `p:grpSp` or
+`p:cxnSp` is legal OOXML the slot contract cannot bind; the import fails with a
+named diagnostic instead of mis-binding it. Each record carries `host`,
+`resolvedType` (a typeless `<p:ph idx=N/>` resolves its type through the layout,
+then the master) and `contentState`.
+
+`contentState` is `empty` or `populated` only, decided structurally per role
+(`a:t` for text, `a:blip` for picture, `a:tbl`, `c:chart`/`cx:chart`,
+`dgm:relIds`) — never from text presence, because PowerPoint stores layout prompt
+strings as real `<a:t>`. There is deliberately no `absent` state: a slide that
+omits a placeholder has no record to carry one, so absence is resolved against
+the layout roster during materialization.
+
+| Placeholder content | Slot | Recovered |
+|---|---|---|
+| Text, picture, and native Chart/Table with a JSON payload | full role, bound carrier | yes |
+| An unfilled placeholder of any role | full role, blank carrier (`data-pptx-binding="empty"` for chart/table) | n/a — a valid, fillable slot |
+| Chart/Table the importer could not convert natively (`data-pptx-replacement-status`) | full role, proxy binding | slot and visible fallback artwork only; not a native `a:tbl` / `c:chart` |
+| `media` | `media` role, image carrier | poster frame only — `videoFile` / `audioFile` are not read, so the media stream is not round-tripped |
+| SmartArt / diagram, OLE | `object` role, proxy binding | imported preview only; node text, structure, `progId` and the embedded part are not recovered |
+| `clipArt`, `dgm`, `sldImg`, `hdr` | mapped to `picture` / `object` / `picture` / `body` | the distinct OOXML subtype is not preserved |
+
+Not supported: ink (`p:contentPart`) is not walked; a rotated or flipped
+placeholder loses its group rotation when its carrier is lifted.
+
 **Artifact roles**: `analysis/manifest.json` is the truth for source-deck facts (slide size, theme, fonts, background inheritance, resource inventory, declared structure, reuse relationships); `analysis/native_structure.json` for source PowerPoint identity (keys, picker names, parents, placeholder types/indices, package hash); `svg/inheritance.json` for consumption and visibility. The three overlap only at contract boundaries so materialization can cross-check identity, ownership, and visibility — never collapse or substitute them. `authoring_summary.json` is the model-facing roster index; `authoring_manifest.json` is machine-only provenance validated by the mirror compiler. Exported `images/` is the canonical reusable image pool; `icons/imported/*.svg` is the canonical decoration pool but not part of the default read set — use `authoring_summary.json` `icon_refs` and cleaned SVGs first, query `*_vector_asset_inventory.json` by exact asset id only when source-ref or fingerprint detail is needed, and open an individual asset only when it affects a design decision.
+
+### Template context
+
+`analysis/template_context.json` (`ppt-master.template-context.v1`) is a derived,
+generator-facing view of the template for consumers outside PPT Master — a
+downstream writer that fills the real PPTX itself, and needs to know what each box
+physically holds instead of carrying hand-maintained per-template rules. It is a
+serializer over the existing import resolvers, not a second parser, and the source
+PPTX remains the source of truth.
+
+Every layout in the package is described, including layouts no sample slide uses.
+Layout and master keys are taken from `native_structure.json`, so the two artifacts
+join on `key`. Units are carried in field names (`_in`, `_pt`, `_deg`).
+
+Per placeholder: identity (`placeholder_type`, `idx`, `semantic_role`, `host`,
+`is_placeholder`, `shape_name`), `geometry_in` (position, size, rotation, flips),
+`text_behavior` (`wrap`, `anchor`, `vertical`, `columns`, `insets_in`, and `autofit`
+with `font_scale_pct` / `line_space_reduction_pct`), and one record per declared list
+level carrying font family and size, line spacing, paragraph spacing, alignment,
+margin and indent, and bullet structure. Non-placeholder shapes are reported
+separately under `static_shapes` with `is_placeholder: false`.
+
+Bullets keep their structure rather than collapsing to a boolean: `bullet.kind` is
+`none`, `character` (with `char` and `font`), or `auto_number` (with `scheme` and
+`start_at`).
+
+**Fact classes.** Each value is one of: **extracted** — read from the PPTX with
+master/layout inheritance applied; **derived** — computed from extracted values, such
+as `capacity` and unit conversions; **exemplar** — observed in a real slide that uses
+the layout. `text_behavior.provenance` names the level that supplied each resolved
+value (`layout` / `master` / `default`), so a declared value is distinguishable from
+an OOXML default.
+
+**No semantic inference is emitted.** PowerPoint encodes placeholder type, geometry,
+typography and list structure, but not purpose; labels such as caption, quote, eyebrow
+or primary content are absent by design and `semantic_inference.present` is always
+`false`. Derive them downstream from geometry, typography and exemplars — layout prompt
+text is generic ("Click to edit Master text styles"), so exemplars are usually the only
+evidence distinguishing, say, a one-line label from a full content column.
+
+**Capacity is approximate and says so.** `chars_per_line` and `lines` come from the
+same `estimate_text_width` routine the importer wraps text with, so the estimate agrees
+with the rendering pipeline, but advance widths are estimated rather than measured from
+font files. Every record carries `exact: false`, and `capacity_basis` documents the
+method. `chars_per_line` is `null` when `wrap` is `none`. Capacity is not adjusted for
+autofit; `text_behavior.autofit` is reported separately so a consumer can tell whether
+overflow shrinks or spills.
 
 ## Type B source bundles
 

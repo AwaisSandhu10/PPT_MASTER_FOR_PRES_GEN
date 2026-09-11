@@ -45,6 +45,10 @@ from template_import.native_structure import (
     SOURCE_TEMPLATE_NAME,
     write_native_structure_bundle,
 )
+from template_import.template_context import (
+    CONTEXT_NAME,
+    write_template_context,
+)
 
 configure_utf8_stdio()
 
@@ -257,6 +261,11 @@ def main() -> int:
             except (OSError, ValueError) as exc:
                 print(f"Error: failed to write native structure bundle: {exc}")
                 return 1
+            try:
+                write_template_context(pptx_path, staged_dir, native_structure)
+            except (OSError, ValueError, ET.ParseError) as exc:
+                print(f"Error: failed to write template context: {exc}")
+                return 1
 
         result = None
         total_bytes = 0
@@ -320,6 +329,7 @@ def main() -> int:
                 managed_root_files={
                     _MANIFEST_NAME,
                     CONTRACT_NAME,
+                    CONTEXT_NAME,
                     SOURCE_TEMPLATE_NAME,
                     _CONVERSION_REPORT_NAME,
                 },
@@ -373,6 +383,7 @@ def main() -> int:
         print(f"SVG bytes (primary): {total_bytes}")
         print(f"Output directory: {output_dir}")
         if native_structure is not None:
+            print(f"Template context: {CONTEXT_NAME}")
             print(
                 "Source structure assessment: "
                 f"{native_structure['strategy']['recommendedMode']}; "
