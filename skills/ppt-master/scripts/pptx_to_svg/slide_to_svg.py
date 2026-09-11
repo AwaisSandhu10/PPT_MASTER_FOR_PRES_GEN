@@ -95,7 +95,7 @@ from .prstgeom_to_svg import GeomResult, convert_prst_geom
 from .preset_svg_markup import serialize_preset_layers
 from .shape_walker import (
     CONNECTOR, GRAPHIC, GROUP, PICTURE, SHAPE,
-    ShapeNode, get_background, walk_sp_tree,
+    ScopedBodyPr, ShapeNode, get_background, walk_sp_tree,
 )
 from .tbl_to_svg import convert_tbl
 from .txbody_to_svg import (
@@ -133,6 +133,8 @@ class AssemblyContext:
     group_id_prefix: str = ""
     render_graphic_previews: bool = True
     preserve_placeholder_inheritance: bool = False
+    # Which inheritance level this part's own placeholders sit at.
+    placeholder_scope: str = "slide"
     asset_name_map: dict[str, str] = field(default_factory=dict)
     diagnostics: list[ImportDiagnostic] = field(default_factory=list)
     source_slide_index: int | None = None
@@ -382,6 +384,7 @@ def assemble_part_solo(
         strict=strict,
         group_id_prefix=f"{role}-",
         render_graphic_previews=False,
+        placeholder_scope=role,
         asset_name_map=asset_name_map or {},
         diagnostics=diagnostics if diagnostics is not None else [],
     )
@@ -754,6 +757,9 @@ def _convert_shape(node: ShapeNode, ctx: AssemblyContext, *, top_level: bool) ->
     placeholder_sp_pr = _placeholder_sp_pr_metadata(node, ctx)
     if placeholder_sp_pr:
         inner_parts.append(placeholder_sp_pr)
+    placeholder_body_pr = _placeholder_body_pr_metadata(node, ctx)
+    if placeholder_body_pr:
+        inner_parts.append(placeholder_body_pr)
     if visible_text_svg:
         inner_parts.append(visible_text_svg)
     inner = "\n".join(inner_parts) if inner_parts else ""
@@ -768,7 +774,7 @@ def _convert_shape(node: ShapeNode, ctx: AssemblyContext, *, top_level: bool) ->
 
 def _effective_placeholder_tx_body(
     tx_body: ET.Element | None,
-    inherited_body_properties: tuple[ET.Element, ...],
+    inherited_body_properties: tuple[ScopedBodyPr, ...],
 ) -> ET.Element | None:
     """Merge inherited placeholder bodyPr settings into one visible text body."""
     if tx_body is None or not inherited_body_properties:
@@ -785,7 +791,8 @@ def _effective_placeholder_tx_body(
         {"scene3d"},
         {"sp3d"},
     )
-    for inherited in inherited_body_properties:
+    for scoped in inherited_body_properties:
+        inherited = scoped.body_pr
         for name, value in inherited.attrib.items():
             body_pr.attrib.setdefault(name, value)
         local_names = {
@@ -1169,6 +1176,41 @@ def _placeholder_sp_pr_metadata(
         f'data-pptx-ooxml-sha256="{hashlib.sha256(raw).hexdigest()}">'
         f'{base64.b64encode(raw).decode("ascii")}</metadata>'
     )
+
+
+def _body_pr_metadata_element(scope: str, body_pr: ET.Element) -> str:
+    raw = ET.tostring(body_pr, encoding="utf-8")
+    return (
+        '<metadata data-pptx-part="placeholder-bodypr" '
+        f'data-pptx-scope="{scope}" '
+        'data-pptx-encoding="base64" '
+        f'data-pptx-ooxml-sha256="{hashlib.sha256(raw).hexdigest()}">'
+        f'{base64.b64encode(raw).decode("ascii")}</metadata>'
+    )
+
+
+def _placeholder_body_pr_metadata(node: ShapeNode, ctx: AssemblyContext) -> str:
+    """Preserve the unresolved bodyPr chain so text fitting survives export.
+
+    Each level is kept separately rather than merged: a reusable template must
+    restore the layout's own text behaviour and let a slide inherit it, which a
+    resolved value stamped onto every placeholder cannot express.
+    """
+    if node.placeholder is None or node.kind != SHAPE:
+        return ""
+    parts = []
+    seen: set[str] = set()
+    own = node.xml.find("p:txBody/a:bodyPr", NS)
+    if own is not None and not has_relationship_attributes(own):
+        seen.add(ctx.placeholder_scope)
+        parts.append(_body_pr_metadata_element(ctx.placeholder_scope, own))
+    for scoped in node.inherited_body_properties:
+        # Entries arrive in inheritance priority order; the nearest wins.
+        if scoped.scope in seen or has_relationship_attributes(scoped.body_pr):
+            continue
+        seen.add(scoped.scope)
+        parts.append(_body_pr_metadata_element(scoped.scope, scoped.body_pr))
+    return "\n".join(parts)
 
 
 def _resolve_geometry(node: ShapeNode, sp_pr: ET.Element | None) -> GeomResult | None:

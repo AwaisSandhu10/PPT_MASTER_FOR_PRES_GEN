@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import mimetypes
@@ -3026,11 +3027,16 @@ def _presentation_slide_size_emu(extract_dir: Path) -> tuple[int, int]:
     return width, height
 
 
+# The SVG canvas is a whole-pixel view of a slide size that need not be a whole
+# number of pixels, so a full-slide rect can land a fraction of a pixel off.
+_BACKGROUND_BOUNDS_TOLERANCE_EMU = EMU_PER_PX // 2
+
+
 def _solid_background_xml_from_shape(
     shape: ET.Element,
     slide_size_emu: tuple[int, int],
 ) -> str | None:
-    """Convert one exact full-slide solid rectangle shape into p:bg XML."""
+    """Convert one full-slide solid rectangle shape into p:bg XML."""
     if shape.tag != f"{{{PML_NS}}}sp":
         return None
     if shape.find(f"{{{PML_NS}}}txBody") is not None:
@@ -3054,7 +3060,10 @@ def _solid_background_xml_from_shape(
         )
     except (KeyError, ValueError):
         return None
-    if bounds != (0, 0, *slide_size_emu):
+    if any(
+        abs(actual - expected) > _BACKGROUND_BOUNDS_TOLERANCE_EMU
+        for actual, expected in zip(bounds, (0, 0, *slide_size_emu))
+    ):
         return None
 
     geometry = sp_pr.find(f"{{{DML_NS}}}prstGeom")
@@ -3391,24 +3400,69 @@ def _placeholder_vertical_anchor(
     )
 
 
+_AUTOFIT_TAGS = frozenset({
+    f"{{{DML_NS}}}noAutofit",
+    f"{{{DML_NS}}}normAutofit",
+    f"{{{DML_NS}}}spAutoFit",
+})
+
+
+def _apply_imported_body_properties(
+    body_pr: ET.Element,
+    body_properties: tuple[tuple[str, str], ...],
+    scope: str,
+) -> bool:
+    """Overlay the source template's bodyPr for one inheritance level.
+
+    Returns False when the source declared nothing at this level, which for a
+    slide means the Layout's own text behaviour must be left to inherit.
+    """
+    payload = next((xml for name, xml in body_properties if name == scope), None)
+    if payload is None:
+        return False
+    source = ET.fromstring(payload)
+    for name, value in source.attrib.items():
+        body_pr.set(name, value)
+    # Only what this level actually declares is replaced. A level that says
+    # nothing must leave the level beneath it standing.
+    for child in source:
+        for existing in list(body_pr):
+            if existing.tag == child.tag or (
+                existing.tag in _AUTOFIT_TAGS and child.tag in _AUTOFIT_TAGS
+            ):
+                body_pr.remove(existing)
+        body_pr.append(copy.deepcopy(child))
+    return True
+
+
+def _clear_autofit(body_pr: ET.Element) -> None:
+    for child in list(body_pr):
+        if child.tag in _AUTOFIT_TAGS:
+            body_pr.remove(child)
+
+
 def _normalize_placeholder_body_properties(
     body_pr: ET.Element,
     source_bounds: tuple[int, int, int, int],
     target_bounds: tuple[int, int, int, int],
+    *,
+    default_autofit: bool,
 ) -> None:
-    """Make a full-frame placeholder wrap text while preserving vertical intent."""
-    body_pr.set("wrap", "square")
-    body_pr.set("anchor", _placeholder_vertical_anchor(source_bounds, target_bounds))
-    body_pr.set("anchorCtr", "0")
-    autofit_tags = {
-        f"{{{DML_NS}}}noAutofit",
-        f"{{{DML_NS}}}normAutofit",
-        f"{{{DML_NS}}}spAutoFit",
-    }
-    for child in list(body_pr):
-        if child.tag in autofit_tags:
-            body_pr.remove(child)
-    body_pr.append(ET.Element(f"{{{DML_NS}}}noAutofit"))
+    """Supply only the text behaviour the source template left unspecified.
+
+    Anything the source declared stays untouched, so an imported placeholder
+    keeps the wrapping, anchoring and autofit PowerPoint gave it.
+    """
+    body_pr.attrib.setdefault("wrap", "square")
+    body_pr.attrib.setdefault(
+        "anchor",
+        _placeholder_vertical_anchor(source_bounds, target_bounds),
+    )
+    body_pr.attrib.setdefault("anchorCtr", "0")
+    if default_autofit and not any(
+        child.tag in _AUTOFIT_TAGS for child in body_pr
+    ):
+        body_pr.append(ET.Element(f"{{{DML_NS}}}noAutofit"))
 
 
 def _apply_layout_frame_to_placeholder_carrier(
@@ -3457,10 +3511,21 @@ def _apply_layout_frame_to_placeholder_carrier(
     if body_pr is None:
         body_pr = ET.Element(f"{{{DML_NS}}}bodyPr")
         tx_body.insert(0, body_pr)
+    # The compiled carrier arrives with a generated autofit. Drop it so the
+    # source Slide's own declaration decides, and so silence inherits.
+    _clear_autofit(body_pr)
+    _apply_imported_body_properties(
+        body_pr,
+        item.placeholder_body_properties,
+        "slide",
+    )
     _normalize_placeholder_body_properties(
         body_pr,
         source_bounds,
         target_bounds,
+        # Never stamp an autofit here: a Slide-level element would shadow the
+        # Layout's, which is what this template must keep inheriting.
+        default_autofit=False,
     )
 
 
@@ -3544,8 +3609,20 @@ def _set_no_bullet_paragraph_properties(
         )
         paragraph_props.insert(insert_at, ET.Element(f"{{{DML_NS}}}buNone"))
 
-    paragraph_props.set("marL", "0")
+    # Dropping the bullet drops its hanging indent, but not the paragraph's own
+    # indent level: marL carries both, so keep the part the glyph did not own.
+    paragraph_props.set("marL", str(_paragraph_indent_level_emu(paragraph_props)))
     paragraph_props.set("indent", "0")
+
+
+def _paragraph_indent_level_emu(paragraph_props: ET.Element) -> int:
+    """The left margin left over once a bullet's hanging indent is removed."""
+    try:
+        margin = int(paragraph_props.get("marL", "0"))
+        hanging = abs(int(paragraph_props.get("indent", "0")))
+    except ValueError:
+        return 0
+    return max(margin - hanging, 0)
 
 
 def _placeholder_text_body(
@@ -3582,10 +3659,21 @@ def _placeholder_text_body(
         # intentionally not reused for the Layout's synthetic p:sp carrier.
         # The explicit design-zone bounds remain the authoritative frame.
         source_bounds = target_bounds
+    # _clear_master_placeholder_shapes leaves the output Master without
+    # placeholders, so the Master level of the source chain has nowhere of its
+    # own to live. Fold it in underneath the Layout, which is the nearest level
+    # that survives, so a Slide still resolves the behaviour the source gave it.
+    for scope in ("master", "layout"):
+        _apply_imported_body_properties(
+            body_pr,
+            item.placeholder_body_properties,
+            scope,
+        )
     _normalize_placeholder_body_properties(
         body_pr,
         source_bounds,
         target_bounds,
+        default_autofit=True,
     )
     tx_body.append(body_pr)
     list_style = (
@@ -3659,7 +3747,12 @@ def _set_placeholder_no_inherited_bullets(
     shape: ET.Element,
     item: TemplateElementSpec,
 ) -> None:
-    """Keep prose bullet-free while preserving explicit subtitle bullets."""
+    """Suppress bullets a prose placeholder would inherit, keep declared ones.
+
+    A bullet in the slide's own pPr was preserved from the source template, so
+    it is what that paragraph is meant to show; only the layout's inherited
+    bullet has to be turned off here.
+    """
     if item.placeholder not in {"body", "subtitle"}:
         return
     tx_body = shape.find(f"{{{PML_NS}}}txBody")
@@ -3670,10 +3763,7 @@ def _set_placeholder_no_inherited_bullets(
         if paragraph_props is None:
             paragraph_props = ET.Element(f"{{{DML_NS}}}pPr")
             paragraph.insert(0, paragraph_props)
-        _set_no_bullet_paragraph_properties(
-            paragraph_props,
-            replace_existing=item.placeholder == "body",
-        )
+        _set_no_bullet_paragraph_properties(paragraph_props)
 
 
 def _set_placeholder_theme_font_role(
@@ -6711,11 +6801,16 @@ def create_pptx_with_native_svg(
     template_layout_parts_by_key: dict[str, str] | None = None
     template_master_parts_by_key: dict[str, str] | None = None
     if template_specs is not None and not native_objects:
+        # Only a marker-bound slot has a native object to convert. An unbound
+        # ("empty") or fallback-artwork ("proxy") Chart/Table slot carries no
+        # marker, so requiring the flag for it would block every template whose
+        # source left such a placeholder unfilled.
         native_placeholders = sorted({
             item.placeholder
             for spec in template_specs
             for item in spec.placeholders
             if item.placeholder in {"chart", "table"}
+            and item.placeholder_binding == "carrier"
         })
         if native_placeholders:
             kinds = ", ".join(str(kind) for kind in native_placeholders)

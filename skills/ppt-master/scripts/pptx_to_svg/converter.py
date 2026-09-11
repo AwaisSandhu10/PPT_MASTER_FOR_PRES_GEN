@@ -357,7 +357,9 @@ def _roundtrip_native_structure(
                 "parentPath": master.path,
                 "showMasterShapes": part_show_master_sp(layout),
                 "drawableShapeCount": count_drawable_shapes(layout.xml),
-                "placeholders": extract_placeholders(layout.xml),
+                "placeholders": extract_placeholders(
+                    layout.xml, master_root=master.xml,
+                ),
                 "usedBySlides": used_layouts.get(layout.path, []),
             }
             for layout, master in layouts_with_parents
@@ -369,7 +371,11 @@ def _roundtrip_native_structure(
                 "layoutPath": slide.layout.path if slide.layout else None,
                 "masterPath": slide.master.path if slide.master else None,
                 "showInheritedShapes": part_show_master_sp(slide.part),
-                "placeholders": extract_placeholders(slide.part.xml),
+                "placeholders": extract_placeholders(
+                    slide.part.xml,
+                    layout_root=slide.layout.xml if slide.layout else None,
+                    master_root=slide.master.xml if slide.master else None,
+                ),
                 "svgFile": f"slide_{slide.index:02d}.svg",
             }
             for slide in slides

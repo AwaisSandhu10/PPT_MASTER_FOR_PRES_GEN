@@ -56,6 +56,7 @@ from native_payloads import (
     serialize_native_payload_store,
 )
 from pptx_shapes import (
+    CONNECTOR_PRESET_TYPES,
     NATIVE_FALLBACK_SHA256_ATTR,
     svg_native_fallback_fingerprint,
     svg_preset_preview_fingerprint,
@@ -69,6 +70,7 @@ from svg_authoring_view import (
 )
 from svg_finalize.flatten_tspan import flatten_text_with_tspans
 from svg_to_pptx.pptx_package.template_structure import (
+    OBJECT_PLACEHOLDER_TAGS,
     SOURCE_THEMES_FILENAME,
     SOURCE_THEMES_SCHEMA,
     TemplateStructureError,
@@ -76,6 +78,7 @@ from svg_to_pptx.pptx_package.template_structure import (
     parse_template_slides,
 )
 from svg_to_pptx.native_objects import stamp_native_fallback_baseline
+from svg_to_pptx.drawingml.utils import is_picture_effect_carrier
 from template_text_slots import (
     analyze_template_text_slots,
     text_slot_integrity_sha256,
@@ -1553,6 +1556,33 @@ def _flatten_fixed_group(group: ET.Element, *, context: str) -> list[ET.Element]
     return atoms
 
 
+def _is_degenerate_axis_connector(element: ET.Element) -> bool:
+    """Whether one element is a rule/connector flattened onto a single axis.
+
+    A vertical rule is ``width=0`` and a horizontal one ``height=0``. That is
+    valid PowerPoint geometry, so it must not be read as a missing frame, but a
+    zero-extent module box is not a valid ``data-pptx-bounds`` either.
+    """
+    if (
+        element.get("data-pptx-object") != "connector"
+        and (element.get("data-pptx-prst") or "") not in CONNECTOR_PRESET_TYPES
+    ):
+        return False
+    raw = (element.get("data-pptx-frame") or "").replace(",", " ").split()
+    if len(raw) != 4:
+        return False
+    try:
+        values = [float(item) for item in raw]
+    except ValueError:
+        return False
+    if not all(math.isfinite(item) for item in values):
+        return False
+    width, height = values[2], values[3]
+    if width < 0 or height < 0:
+        return False
+    return (width == 0) != (height == 0)
+
+
 def _flatten_fixed_text_atoms(atoms: Iterable[ET.Element]) -> list[ET.Element]:
     flattened: list[ET.Element] = []
     for atom in atoms:
@@ -2184,6 +2214,22 @@ def _blank_image_carrier(plan: SlotPlan) -> ET.Element:
     )
 
 
+def _blank_object_carrier(plan: SlotPlan) -> ET.Element:
+    x, y, width, height = plan.bounds
+    return ET.Element(
+        f"{{{SVG_NS}}}rect",
+        {
+            "x": format_coordinate(x),
+            "y": format_coordinate(y),
+            "width": format_coordinate(width),
+            "height": format_coordinate(height),
+            "fill": "none",
+            "stroke": "none",
+            "data-pptx-carrier": "true",
+        },
+    )
+
+
 def _format_number(value: float) -> str:
     return f"{value:.8f}".rstrip("0").rstrip(".") or "0"
 
@@ -2198,12 +2244,182 @@ def _optional_float(value: str | None) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+_TEXT_SLOT_ROLES = {
+    "title",
+    "subtitle",
+    "body",
+    "date",
+    "footer",
+    "slide-number",
+}
+
+# A slot with no bound content. "absent" means the Slide never declared the
+# placeholder; "empty" means it declared it and left it blank. Both render the
+# same blank carrier, but they are kept apart because an unexpected "absent" on
+# a Slide prototype means placeholder matching failed rather than that the
+# author left the slot open.
+_UNBOUND_CONTENT_STATES = {"absent", "empty"}
+
+
+# The canonical PowerPoint placeholder identity. A bound carrier keeps it so
+# the slot still round-trips to <p:ph type=... idx=... sz=... orient=...>, which
+# matters most when the carrier is an imported crop <svg> lifted out of its
+# placeholder group rather than the group itself.
+_CANONICAL_PLACEHOLDER_ATTRIBUTES = (
+    "data-ph-type",
+    "data-pptx-placeholder-index",
+    "data-pptx-placeholder-size",
+    "data-pptx-placeholder-orientation",
+)
+
+
+def _preserve_placeholder_identity(
+    carrier: ET.Element,
+    source: ET.Element | None,
+) -> None:
+    """Carry the source placeholder's native identity onto its bound carrier."""
+    if source is None:
+        return
+    for name in _CANONICAL_PLACEHOLDER_ATTRIBUTES:
+        value = source.get(name)
+        if value is not None and carrier.get(name) is None:
+            carrier.set(name, value)
+
+
+def _body_pr_metadata(source: ET.Element | None) -> list[ET.Element]:
+    """Return a placeholder's imported bodyPr metadata, if it carries any."""
+    if source is None:
+        return []
+    return [
+        child
+        for child in source
+        if _local_name(child.tag) == "metadata"
+        and child.get("data-pptx-part") == "placeholder-bodypr"
+    ]
+
+
+def _preserve_body_properties(
+    wrapper: ET.Element,
+    *sources: ET.Element | None,
+) -> None:
+    """Move the source template's text behaviour onto the slot itself.
+
+    The slot outlives the artwork it was lifted from, so an empty slot keeps
+    the wrapping and autofit its Layout declared instead of falling back to a
+    generated default.
+    """
+    seen: set[str] = set()
+    for source in sources:
+        for metadata in _body_pr_metadata(source):
+            scope = metadata.get("data-pptx-scope") or ""
+            if scope in seen:
+                continue
+            seen.add(scope)
+            wrapper.append(copy.deepcopy(metadata))
+
+
+def _outermost_matches(
+    container: ET.Element | None,
+    predicate,
+) -> list[ET.Element]:
+    """Return matching elements without descending into a match.
+
+    An imported crop is ``<g><svg><image/></svg></g>``; matching every
+    descendant would count the crop and its image as two carriers.
+    """
+    matches: list[ET.Element] = []
+
+    def walk(element: ET.Element) -> None:
+        for child in element:
+            if predicate(child):
+                matches.append(child)
+            else:
+                walk(child)
+
+    if container is not None:
+        walk(container)
+    return matches
+
+
+def _is_picture_carrier(element: ET.Element) -> bool:
+    tag = _local_name(element.tag)
+    if tag in {"image", "svg"}:
+        return _visible_leaf(element)
+    return tag == "g" and is_picture_effect_carrier(element)
+
+
+def _native_marker_carrier(
+    container: ET.Element | None,
+    role: str,
+) -> ET.Element | None:
+    """Return the single native Chart/Table marker group, if there is one."""
+    if container is None:
+        return None
+    if container.get("data-pptx-replace-with") == role:
+        return container
+    matches = [
+        element
+        for element in container.iter()
+        if element.get("data-pptx-replace-with") == role
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _is_import_fallback(container: ET.Element | None) -> bool:
+    """Whether an imported object rendered as fallback artwork.
+
+    Native Chart/Table conversion is best-effort: the importer records
+    ``data-pptx-replacement-status`` and emits visible artwork instead of a
+    marker when the source falls outside the native contract. That is valid
+    imported content, not a malformed carrier.
+    """
+    if container is None:
+        return False
+    return any(
+        element.get("data-pptx-replacement-status") is not None
+        or element.get("data-pptx-import-source") is not None
+        for element in container.iter()
+    )
+
+
+def _proxy_children(container: ET.Element) -> list[ET.Element]:
+    return [
+        copy.deepcopy(child)
+        for child in container
+        if _visible_leaf(child)
+    ]
+
+
+def _blank_slot_carrier(
+    plan: SlotPlan,
+    layout_guide: ET.Element | None,
+    master_guide: ET.Element | None,
+) -> ET.Element:
+    """Return the canonical blank carrier for one unbound slot.
+
+    The tag matches the populated form for the same role, because a Layout's
+    bindings are derived from its first prototype and one slot can be filled on
+    one Slide and blank on another.
+    """
+    if plan.semantic_role in {"picture", "media"}:
+        return _blank_image_carrier(plan)
+    if plan.semantic_role == "object":
+        return _blank_object_carrier(plan)
+    if plan.semantic_role in {"chart", "table"}:
+        # A native marker asserts a convertible payload, so an unbound
+        # Chart/Table slot cannot carry one. It materializes as the empty text
+        # shape PowerPoint itself uses for an unfilled placeholder.
+        return _blank_text_carrier(plan, None, None)
+    return _blank_text_carrier(plan, layout_guide, master_guide)
+
+
 def _slot_wrapper(
     plan: SlotPlan,
     source: ET.Element | None,
     *,
     layout_guide: ET.Element | None,
     master_guide: ET.Element | None,
+    content_state: str,
 ) -> tuple[ET.Element, list[ET.Element]]:
     wrapper = ET.Element(
         f"{{{SVG_NS}}}g",
@@ -2217,17 +2433,13 @@ def _slot_wrapper(
     )
     if plan.idx is not None:
         wrapper.set("data-pptx-idx", str(plan.idx))
+    _preserve_body_properties(wrapper, source, layout_guide, master_guide)
 
     extras: list[ET.Element] = []
-    if plan.semantic_role in {
-        "title",
-        "subtitle",
-        "body",
-        "date",
-        "footer",
-        "slide-number",
-    }:
-        carrier = _copy_text_carrier(source)
+    unbound = content_state in _UNBOUND_CONTENT_STATES or source is None
+
+    if plan.semantic_role in _TEXT_SLOT_ROLES:
+        carrier = None if unbound else _copy_text_carrier(source)
         if carrier is None:
             carrier = _blank_text_carrier(plan, layout_guide, master_guide)
         extras = _resolved_placeholder_decorations(
@@ -2240,58 +2452,64 @@ def _slot_wrapper(
         wrapper.append(carrier)
         return wrapper, extras
 
+    # Content only ever comes from the Slide. A Layout placeholder holds a
+    # prompt guide ("Click icon to add table"), which is a slot declaration
+    # rather than artwork; treating it as content is what made an unfilled
+    # Layout slot look like a malformed one.
+    if unbound:
+        if plan.semantic_role in {"chart", "table"}:
+            wrapper.set("data-pptx-binding", "empty")
+        wrapper.append(_blank_slot_carrier(plan, layout_guide, master_guide))
+        return wrapper, extras
+
     if plan.semantic_role == "object":
-        proxy_source = source
-        if proxy_source is None:
-            proxy_source = layout_guide
-        if proxy_source is None:
-            proxy_source = master_guide
-        if proxy_source is None:
-            raise MirrorMaterializationError(
-                f"Object slot {plan.slot_id!r} has no visible proxy source"
-            )
-        visible = [copy.deepcopy(child) for child in proxy_source if _visible_leaf(child)]
+        visible = _proxy_children(source)
         if not visible:
-            raise MirrorMaterializationError(
-                f"Object slot {plan.slot_id!r} has no visible proxy content"
-            )
+            wrapper.append(_blank_slot_carrier(plan, layout_guide, master_guide))
+            return wrapper, extras
+        # One ordinary atom binds directly. Proxy is the fallback for composite
+        # content, and it is worth avoiding: a slot that binds as a carrier when
+        # filled still binds as a carrier when blank, so the same slot stays
+        # consistent across every Slide that uses the Layout.
+        if len(visible) == 1 and _local_name(visible[0].tag) in OBJECT_PLACEHOLDER_TAGS:
+            carrier = visible[0]
+            _preserve_placeholder_identity(carrier, source)
+            carrier.set("data-pptx-carrier", "true")
+            wrapper.append(carrier)
+            return wrapper, extras
         wrapper.set("data-pptx-binding", "proxy")
         for child in visible:
             wrapper.append(child)
         return wrapper, extras
 
-    expected_tags = {
-        "picture": {"image", "svg"},
-        "media": {"image", "svg"},
-        "chart": {"g"},
-        "table": {"g"},
-    }[plan.semantic_role]
-    carrier_source = source or layout_guide
-    candidates = [
-        element
-        for element in (carrier_source.iter() if carrier_source is not None else [])
-        if _local_name(element.tag) in expected_tags and _visible_leaf(element)
-    ]
-    if (
-        not candidates
-        and source is None
-        and layout_guide is not None
-        and plan.semantic_role in {"picture", "media"}
-    ):
-        wrapper.append(_blank_image_carrier(plan))
-        return wrapper, extras
+    if plan.semantic_role in {"chart", "table"}:
+        carrier = _native_marker_carrier(source, plan.semantic_role)
+        if carrier is not None:
+            carrier = copy.deepcopy(carrier)
+            _preserve_placeholder_identity(carrier, source)
+            carrier.set("data-pptx-carrier", "true")
+            wrapper.append(carrier)
+            return wrapper, extras
+        if _is_import_fallback(source):
+            visible = _proxy_children(source)
+            if visible:
+                wrapper.set("data-pptx-binding", "proxy")
+                for child in visible:
+                    wrapper.append(child)
+                return wrapper, extras
+        raise MirrorMaterializationError(
+            f"Slot {plan.slot_id!r} {plan.semantic_role} content is neither a "
+            "native marker group nor imported fallback artwork"
+        )
+
+    candidates = _outermost_matches(source, _is_picture_carrier)
     if len(candidates) != 1:
         raise MirrorMaterializationError(
             f"Slot {plan.slot_id!r} requires exactly one visible "
             f"{plan.semantic_role} carrier, found {len(candidates)}"
         )
     carrier = copy.deepcopy(candidates[0])
-    if plan.semantic_role in {"chart", "table"}:
-        marker = carrier.get("data-pptx-replace-with")
-        if marker != plan.semantic_role:
-            raise MirrorMaterializationError(
-                f"Slot {plan.slot_id!r} {plan.semantic_role} carrier lacks native marker"
-            )
+    _preserve_placeholder_identity(carrier, source)
     carrier.set("data-pptx-carrier", "true")
     wrapper.append(carrier)
     return wrapper, extras
@@ -2300,6 +2518,10 @@ def _slot_wrapper(
 def _strip_source_refs(root: ET.Element) -> None:
     for element in root.iter():
         element.attrib.pop(SOURCE_REF_ATTRIBUTE, None)
+        if element.get("data-pptx-carrier") == "true":
+            # data-ph-type is IR-only everywhere except here: on a bound carrier
+            # it is the placeholder's own type and completes its native identity.
+            continue
         element.attrib.pop("data-ph-type", None)
 
 
@@ -2330,6 +2552,33 @@ def _is_full_canvas_rect(
         and math.isclose(values[3], height, abs_tol=0.01)
         and fill not in {None, "none", "transparent"}
     )
+
+
+def _is_solid_background_rect(
+    element: ET.Element,
+    width: float,
+    height: float,
+) -> bool:
+    """Whether a rect qualifies as a Slide's scoped p:bg background.
+
+    Mirrors the export contract's own predicate. A full-canvas rect painted
+    with a gradient or pattern still covers the page, but it cannot compile to
+    a scoped background, so it stays ordinary first-in-paint-order content
+    instead of claiming data-pptx-layer="slide".
+    """
+    if not _is_full_canvas_rect(element, width, height):
+        return False
+    if any(element.get(name) for name in ("transform", "filter", "clip-path")):
+        return False
+    for name in ("rx", "ry"):
+        raw = element.get(name)
+        if raw is not None and raw.strip() not in {"", "0"}:
+            return False
+    fill = (_paint_value(element, "fill") or "").strip().lower()
+    if fill.startswith("url("):
+        return False
+    stroke = (_paint_value(element, "stroke") or "none").strip().lower()
+    return stroke == "none"
 
 
 def _non_visual_nodes(roots: Iterable[ET.Element]) -> tuple[ET.Element | None, list[ET.Element]]:
@@ -2475,7 +2724,7 @@ def _compose_template(
                 continue
             item = copy.deepcopy(child)
             _merge_group_inheritance(slide_root, item)
-            if _is_full_canvas_rect(item, width, height):
+            if _is_solid_background_rect(item, width, height):
                 item.set("id", item.get("id") or f"slide-{slide['index']}-background")
                 item.set("data-pptx-layer", "slide")
                 item.set("data-pptx-editable", "false")
@@ -2485,6 +2734,19 @@ def _compose_template(
                 if _local_name(item.tag) == "g" and _visible_leaf(item):
                     bounds = _frame(item)
                     if bounds is None:
+                        if _is_degenerate_axis_connector(item):
+                            # Expand the wrapper: the rule keeps its geometry as
+                            # a direct atom, which needs no module box.
+                            slide_content.extend(
+                                _flatten_fixed_group(
+                                    item,
+                                    context=(
+                                        f"Slide {slide['index']} connector "
+                                        f"{item.get('id')!r}"
+                                    ),
+                                )
+                            )
+                            continue
                         raise MirrorMaterializationError(
                             f"Slide {slide['index']} root group "
                             f"{item.get('id')!r} has no positive source frame"
@@ -2525,13 +2787,25 @@ def _compose_template(
             )
         )
         source_element = None
+        # "absent" is resolved here, not imported: a Slide that omits a
+        # placeholder has no record to carry a state, so it can only be seen by
+        # matching the Layout slot against the Slide roster and finding nothing.
+        content_state = "absent"
         if slide is not None:
             slide_placeholder = _matching_slide_placeholder(slide, layout_placeholder)
             if slide_placeholder is not None:
+                content_state = str(
+                    slide_placeholder.get("contentState") or "populated"
+                )
                 source_element = source_placeholder_elements.get(
                     f"slide:{slide_placeholder['shapeId']}"
                 )
-                if source_element is None:
+                # An empty placeholder renders nothing, so it has no authoring
+                # element to find. Only a populated one going missing is a fault.
+                if (
+                    source_element is None
+                    and content_state not in _UNBOUND_CONTENT_STATES
+                ):
                     raise MirrorMaterializationError(
                         f"Slide {slide['index']} placeholder {slide_placeholder['shapeId']} "
                         "is missing from its authoring SVG"
@@ -2541,6 +2815,7 @@ def _compose_template(
             source_element,
             layout_guide=layout_guide,
             master_guide=master_guide,
+            content_state=content_state,
         )
         slots.append(wrapper)
         slot_extras.extend(extras)
@@ -2571,6 +2846,46 @@ def _page_type(slide: dict[str, Any]) -> str:
         "ending_candidate": "ending",
     }
     return mapping.get(raw, "content")
+
+
+def _promote_proxy_bindings(
+    materialized_roots: list[tuple[Path, ET.Element]],
+) -> int:
+    """Make one Layout slot's binding agree across every prototype using it.
+
+    A slot can hold composite content on one Slide and be blank on another, but
+    a Layout declares a single binding for all of them. Proxy wins: a carrier
+    cannot hold composite content, whereas a blank slot can stand in as
+    invisible Slide-local content under a proxy binding.
+    """
+    proxy_slots: dict[str, set[str]] = {}
+    for _path, root in materialized_roots:
+        layout_key = root.get("data-pptx-layout")
+        if layout_key is None:
+            continue
+        for slot in root:
+            if slot.get("data-pptx-placeholder") is None:
+                continue
+            if slot.get("data-pptx-binding") == "proxy":
+                proxy_slots.setdefault(layout_key, set()).add(slot.get("id") or "")
+
+    promoted = 0
+    for _path, root in materialized_roots:
+        slot_ids = proxy_slots.get(root.get("data-pptx-layout") or "")
+        if not slot_ids:
+            continue
+        for slot in root:
+            if slot.get("data-pptx-placeholder") is None:
+                continue
+            if slot.get("id") not in slot_ids:
+                continue
+            if slot.get("data-pptx-binding") == "proxy":
+                continue
+            slot.set("data-pptx-binding", "proxy")
+            for element in slot.iter():
+                element.attrib.pop("data-pptx-carrier", None)
+            promoted += 1
+    return promoted
 
 
 def _serialize_svg(root: ET.Element) -> bytes:
@@ -2949,10 +3264,7 @@ def materialize_mirror_template(
             "Mirror source slide indexes must be contiguous and start at 1"
         )
 
-    retained_layout_keys = {
-        str(slide["layoutKey"])
-        for slide in slides
-    }
+    retained_layout_keys = {str(slide["layoutKey"]) for slide in slides}
     missing_layout_keys = retained_layout_keys - set(layouts)
     if missing_layout_keys:
         raise MirrorMaterializationError(
@@ -3060,6 +3372,12 @@ def materialize_mirror_template(
             slot_plans=plans_by_layout[str(layout["key"])],
         )
         materialized_roots.append((filename, root))
+
+    # One standalone prototype per Layout, with every slot unbound, so a future
+    # deck can pick any Layout the source defines rather than only the ones a
+    # sample Slide demonstrated. Numbering continues the Slide series and the
+    # pad width is derived, never fixed.
+    promoted_proxy_slots = _promote_proxy_bindings(materialized_roots)
 
     asset_sources: dict[Path, Path] = {}
     files: list[MaterializedFile] = []
@@ -3242,6 +3560,10 @@ def materialize_mirror_template(
         "omitted_structure": {
             "master_keys": sorted(set(masters) - retained_master_keys),
             "layout_keys": sorted(set(layouts) - retained_layout_keys),
+        },
+        "prototypes": {
+            "slide_count": len(slides),
+            "proxy_binding_promotions": promoted_proxy_slots,
         },
         "template_svg_count": len(materialized_roots),
         "template_execution_manifest": execution_manifest_path.as_posix(),

@@ -52,6 +52,7 @@ _PARAGRAPH_ATTRIBUTES = (
     "data-paragraph-line-break",
     "data-paragraph-soft-break",
     "data-paragraph-space-before",
+    "data-paragraph-indent",
 )
 _NON_OUTPUT_ANCESTORS = frozenset({
     "clipPath",

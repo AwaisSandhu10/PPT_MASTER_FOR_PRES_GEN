@@ -22,6 +22,7 @@ back to paragraph/list defaults, endParaRPr, or spec-default values.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Callable
 from unicodedata import east_asian_width
@@ -68,6 +69,9 @@ class TextRun:
     is_break: bool = False  # marks an a:br within a paragraph
     hyperlink_href: str | None = None
     formula_latex: str | None = None
+    # The source's own <a:buChar>/<a:buAutoNum>, carried on the run that renders
+    # it so export can restate the bullet instead of re-reading the glyph.
+    bullet_spec: dict[str, object] | None = None
 
 
 HyperlinkResolver = Callable[[str, str], str | None]
@@ -95,6 +99,9 @@ class TextParagraph:
     bullet_prefix: str = ""  # rendered prefix like '• ' or '1. '
     bullet_fill: str | None = None
     bullet_fill_opacity: float = 1.0
+    # What the source actually declared, kept beside the rendered prefix so the
+    # bullet survives the round trip as structure rather than as a glyph.
+    bullet_spec: dict[str, object] | None = None
 
 
 @dataclass
@@ -667,7 +674,7 @@ def _parse_paragraph(
     para.line_height_ratio = _line_height_ratio(para_style_chain)
     para.space_before_px = _spacing_points_px(para_style_chain, "a:spcBef/a:spcPts")
     para.space_after_px = _spacing_points_px(para_style_chain, "a:spcAft/a:spcPts")
-    para.bullet_prefix = _resolve_bullet_prefix(
+    para.bullet_prefix, para.bullet_spec = _resolve_bullet(
         para_style_chain, para.level, autonum_state,
     )
     para.bullet_fill, para.bullet_fill_opacity = _resolve_bullet_fill(
@@ -1136,18 +1143,36 @@ def _resolve_bullet_prefix(
     autonum_state: dict[int, int],
 ) -> str:
     """Render bullet glyphs / numbering as a literal text prefix."""
+    return _resolve_bullet(sources, level, autonum_state)[0]
+
+
+def _resolve_bullet(
+    sources: tuple[ET.Element | None, ...],
+    level: int,
+    autonum_state: dict[int, int],
+) -> tuple[str, dict[str, object] | None]:
+    """Return the rendered prefix and the declaration that produced it.
+
+    The prefix is what the SVG draws; the spec is what PowerPoint declared, so
+    export can restate the bullet rather than infer one back from the glyph.
+    """
     bu_none = _child_chain(sources, "a:buNone")
     if bu_none is not None:
         autonum_state.pop(level, None)
-        return ""
+        return "", {"kind": "none"}
     bu_char = _child_chain(sources, "a:buChar")
     if bu_char is not None:
         ch = bu_char.attrib.get("char", "•")
         bu_font = _child_chain(sources, "a:buFont")
         typeface = bu_font.attrib.get("typeface", "") if bu_font is not None else ""
+        spec: dict[str, object] = {"kind": "character", "char": ch}
+        if typeface:
+            spec["font"] = typeface
+        # Wingdings 'l' is a filled disc; substitute only what the SVG draws,
+        # never the declaration, which still round-trips with its own font.
         if typeface.casefold() == "wingdings" and ch == "l":
             ch = "●"
-        return f"{ch} "
+        return f"{ch} ", spec
     bu_auto = _child_chain(sources, "a:buAutoNum")
     if bu_auto is not None:
         start_at = bu_auto.attrib.get("startAt")
@@ -1158,11 +1183,12 @@ def _resolve_bullet_prefix(
                 autonum_state[level] = 1
         else:
             autonum_state[level] = autonum_state.get(level, 0) + 1
-        return _format_auto_number(
-            autonum_state[level],
-            bu_auto.attrib.get("type", "arabicPeriod"),
-        )
-    return ""
+        scheme = bu_auto.attrib.get("type", "arabicPeriod")
+        spec = {"kind": "auto_number", "scheme": scheme}
+        if start_at is not None:
+            spec["start_at"] = autonum_state[level]
+        return _format_auto_number(autonum_state[level], scheme), spec
+    return "", None
 
 
 def _resolve_bullet_fill(
@@ -1355,6 +1381,7 @@ def _wrap_paragraph_into_lines(
         first_run = next((r for r in para.runs if not r.is_break), None)
         if first_run is not None:
             bullet_run = _copy_run(first_run, text=para.bullet_prefix)
+            bullet_run.bullet_spec = para.bullet_spec
             if para.bullet_fill is not None:
                 bullet_run.fill = para.bullet_fill
                 bullet_run.fill_opacity = para.bullet_fill_opacity
@@ -1673,6 +1700,14 @@ def _run_tspan_attrs(run: TextRun) -> str:
     return " " + " ".join(parts)
 
 
+def _bullet_spec_attr(run: TextRun) -> str:
+    """Serialize the source bullet declaration onto its rendered run."""
+    if not run.bullet_spec:
+        return ""
+    payload = json.dumps(run.bullet_spec, sort_keys=True, ensure_ascii=False)
+    return f' data-pptx-bullet="{_xml_escape(payload)}"'
+
+
 def _run_tspan_markup(run: TextRun) -> str:
     formula_attr = ""
     if run.formula_latex is not None:
@@ -1682,7 +1717,7 @@ def _run_tspan_markup(run: TextRun) -> str:
             + '"'
         )
     return (
-        f"<tspan{_run_tspan_attrs(run)}{formula_attr}>"
+        f"<tspan{_run_tspan_attrs(run)}{formula_attr}{_bullet_spec_attr(run)}>"
         f"{_xml_escape(run.text)}</tspan>"
     )
 

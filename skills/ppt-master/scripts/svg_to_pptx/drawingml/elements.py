@@ -6,6 +6,7 @@ import base64
 import binascii
 import hashlib
 import io
+import json
 import math
 import re
 from dataclasses import dataclass
@@ -2057,6 +2058,23 @@ _TEXT_BULLET_RE = re.compile(
 )
 _INLINE_FORMULA_ATTR = 'data-pptx-inline-formula'
 _INLINE_FORMULA_KEY = '_inline_formula_latex'
+# What the source template declared, carried from import on the run that draws
+# the bullet. Authoritative: the glyph match below is only the fallback for SVG
+# that never went through the importer.
+_BULLET_SPEC_ATTR = 'data-pptx-bullet'
+_BULLET_SPEC_KEY = '_bullet_spec'
+
+
+def _declared_bullet_spec(element: ET.Element) -> dict[str, Any] | None:
+    """Read a preserved bullet declaration off one SVG run."""
+    raw = element.get(_BULLET_SPEC_ATTR)
+    if not raw:
+        return None
+    try:
+        spec = json.loads(raw)
+    except ValueError:
+        return None
+    return spec if isinstance(spec, dict) and spec.get('kind') else None
 
 
 def _text_line_vertical_extent(
@@ -2427,6 +2445,47 @@ def _take_leading_chars_from_runs(
     return taken
 
 
+def _declared_bullet_extraction(
+    runs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None] | None:
+    """Use the source's own bullet declaration, when the import preserved one.
+
+    Returns None when no run carries one, leaving the glyph heuristic to run.
+    """
+    index = next(
+        (i for i, run in enumerate(runs) if run.get(_BULLET_SPEC_KEY)),
+        None,
+    )
+    if index is None:
+        return None
+    marker_run = runs[index]
+    spec = marker_run[_BULLET_SPEC_KEY]
+    kind = spec.get('kind')
+    # The prefix run is the drawn glyph; it is always dropped, because a bullet
+    # PowerPoint renders itself must not also sit in the text.
+    stripped = [run for i, run in enumerate(runs) if i != index]
+    if kind == 'none':
+        return stripped, None
+    prefix_width = _estimate_text_runs_width([marker_run], include_headroom=False)
+    bullet: dict[str, Any] = {
+        'fill': marker_run.get('fill'),
+        'fill_raw': marker_run.get('fill_raw'),
+        'opacity': marker_run.get('opacity'),
+        'source_prefix_width_px': prefix_width,
+        'margin_px': max(prefix_width, 8.0),
+        'declared': True,
+    }
+    if kind == 'auto_number':
+        bullet['scheme'] = spec.get('scheme', 'arabicPeriod')
+        if spec.get('start_at') is not None:
+            bullet['start_at'] = spec['start_at']
+    else:
+        bullet['char'] = spec.get('char', '•')
+        if spec.get('font'):
+            bullet['font'] = spec['font']
+    return stripped, bullet
+
+
 def _extract_text_bullet(
     runs: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -2441,6 +2500,9 @@ def _extract_text_bullet(
         or first_nonspace.get(HYPERLINK_RID_KEY) is not None
     ):
         return runs, None
+    declared = _declared_bullet_extraction(runs)
+    if declared is not None:
+        return declared
     full_text = ''.join(str(run.get('text', '')) for run in runs)
     match = _TEXT_BULLET_RE.match(full_text)
     if not match:
@@ -2504,10 +2566,24 @@ def _build_bullet_xml(
         )
     else:
         color_xml = '<a:buClrTx/>'
-    return (
-        f'{color_xml}<a:buSzTx/><a:buFontTx/>'
-        f'<a:buChar char="{_xml_escape(str(bullet.get("char", "•")))}"/>'
-    )
+    # A preserved declaration restates its own typeface and numbering; an
+    # inferred one can only claim the glyph it read out of the text.
+    if bullet.get('font'):
+        font_xml = f'<a:buFont typeface="{_xml_escape(str(bullet["font"]))}"/>'
+    else:
+        font_xml = '<a:buFontTx/>'
+    if bullet.get('scheme'):
+        start_at = bullet.get('start_at')
+        start_attr = f' startAt="{int(start_at)}"' if start_at is not None else ''
+        choice_xml = (
+            f'<a:buAutoNum type="{_xml_escape(str(bullet["scheme"]))}"'
+            f'{start_attr}/>'
+        )
+    else:
+        choice_xml = (
+            f'<a:buChar char="{_xml_escape(str(bullet.get("char", "•")))}"/>'
+        )
+    return f'{color_xml}<a:buSzTx/>{font_xml}{choice_xml}'
 
 
 def _paragraph_pr_xml(
@@ -2518,14 +2594,20 @@ def _paragraph_pr_xml(
     bullet: dict[str, Any] | None = None,
     ctx: ConvertContext | None = None,
     rtl: bool = False,
+    left_indent_px: float = 0.0,
 ) -> str:
     attrs = f'algn="{algn}"'
     if rtl:
         attrs += ' rtl="1"'
+    # marL carries the paragraph's own indent depth; a bullet adds its hanging
+    # offset on top, so the glyph still sits left of the text it labels.
+    left_indent_px = max(left_indent_px, 0.0)
     if bullet:
-        margin = px_to_emu(_bullet_margin_px(bullet, font_size))
+        margin = px_to_emu(left_indent_px + _bullet_margin_px(bullet, font_size))
         indent = px_to_emu(_bullet_indent_px(bullet, font_size))
         attrs += f' marL="{margin}" indent="{indent}"'
+    elif left_indent_px > 0:
+        attrs += f' marL="{px_to_emu(left_indent_px)}"'
     return f'<a:pPr {attrs}>{body_xml}{_build_bullet_xml(bullet, ctx)}</a:pPr>'
 
 
@@ -2707,6 +2789,9 @@ def _collect_inline_runs(
         inline_formula = container.get(_INLINE_FORMULA_ATTR)
         if inline_formula is not None:
             run[_INLINE_FORMULA_KEY] = inline_formula
+        declared = _declared_bullet_spec(container)
+        if declared is not None:
+            run[_BULLET_SPEC_KEY] = declared
         runs.append(run)
 
     for child in container:
@@ -3055,6 +3140,16 @@ def _build_run_xml(
 </a:r>'''
 
 
+def _carrier_wrap_attr(wrap: str, is_placeholder_carrier: bool) -> str:
+    """Return the wrap attribute, or nothing when a placeholder must inherit."""
+    return '' if is_placeholder_carrier else f'wrap="{wrap}" '
+
+
+def _carrier_autofit(autofit_xml: str, is_placeholder_carrier: bool) -> str:
+    """Return the autofit child, or nothing when a placeholder must inherit."""
+    return '' if is_placeholder_carrier else autofit_xml
+
+
 def convert_text(elem: ET.Element, ctx: ConvertContext) -> ShapeResult | None:
     """Convert SVG <text> to DrawingML text shape with multi-run support."""
     raw_x = svg_length_x(elem.get('x'), ctx)
@@ -3149,6 +3244,7 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> ShapeResult | None:
     line_height_px = _f(line_height_attr) if line_height_attr is not None else None
     paragraph_runs: list[list[dict[str, Any]]] | None = None
     paragraph_space_before: list[float] = []
+    paragraph_indent_px: list[float] = []
     paragraph_bullets: list[dict[str, Any] | None] = []
     # Per-tspan widths (visual lines as the deck author drew them) regardless
     # of how many merge into one <a:p>; used to size the textbox so PowerPoint
@@ -3170,9 +3266,13 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> ShapeResult | None:
             line_runs = _normalize_text_run_whitespace(line_runs)
             if not line_runs:
                 continue
+            indent_attr = child.get('data-paragraph-indent')
+            line_indent = _f(indent_attr) if indent_attr else 0.0
             visual_line_runs.append(line_runs)
+            # An indented line needs its offset in the measured width, or the
+            # frame is sized for text that starts further left than it does.
             visual_line_widths.append(
-                _estimate_bullet_line_width(line_runs, fonts, ctx)
+                _estimate_bullet_line_width(line_runs, fonts, ctx) + line_indent
             )
             soft_break = child.get('data-paragraph-soft-break') == '1'
             line_break = child.get('data-paragraph-line-break') == '1'
@@ -3208,9 +3308,11 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> ShapeResult | None:
                 paragraph_runs.append(line_runs)
                 sb_attr = child.get('data-paragraph-space-before')
                 paragraph_space_before.append(_f(sb_attr) if sb_attr else 0.0)
+                paragraph_indent_px.append(line_indent)
         if not paragraph_runs:
             paragraph_runs = None
             paragraph_space_before = []
+            paragraph_indent_px = []
             visual_line_widths = []
             visual_line_runs = []
         else:
@@ -3242,6 +3344,7 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> ShapeResult | None:
         runs = [{**parent_attrs, 'text': '\u200b'}]
         paragraph_runs = None
         paragraph_space_before = []
+        paragraph_indent_px = []
         paragraph_bullets = []
         visual_line_widths = []
         visual_line_runs = []
@@ -3460,7 +3563,12 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> ShapeResult | None:
         line_spc_val = round(line_height_px * FONT_PX_TO_HUNDREDTHS_PT)
         ln_spc_xml = f'<a:lnSpc><a:spcPts val="{line_spc_val}"/></a:lnSpc>'
         paragraph_xml_chunks = []
-        for line, extra_px, bullet in zip(paragraph_runs, paragraph_space_before, paragraph_bullets):
+        for line, extra_px, bullet, indent_px in zip(
+            paragraph_runs,
+            paragraph_space_before,
+            paragraph_bullets,
+            paragraph_indent_px or [0.0] * len(paragraph_runs),
+        ):
             spc_bef_xml = ''
             if extra_px > 0:
                 spc_bef_val = round(extra_px * FONT_PX_TO_HUNDREDTHS_PT)
@@ -3489,6 +3597,7 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> ShapeResult | None:
                     ''.join(str(run.get('text', '')) for run in line),
                     ctx.primary_language,
                 ),
+                left_indent_px=indent_px,
             )
             paragraph_xml_chunks.append(
                 f'<a:p>\n{p_pr_xml}\n{runs_inner}\n</a:p>'
@@ -3525,6 +3634,10 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> ShapeResult | None:
     # instead of shrinking to glyph bounds. Reconstruct insets from the SVG
     # anchor/baseline so the visible text stays at its imported position while
     # remaining ordinary editable DrawingML text.
+    # A placeholder slot inherits its text behaviour from the source template's
+    # Layout and Master. Stamping a generated wrap or autofit here would shadow
+    # that chain, so those two are left unsaid on a carrier and the imported
+    # bodyPr (or PowerPoint's own default) decides.
     if exact_text_frame is not None:
         if exact_text_insets is None:
             raise ValueError('data-pptx-frame text insets were not resolved')
@@ -3533,11 +3646,14 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> ShapeResult | None:
             'none' if ctx.text_flow == TEXT_FLOW_PRESERVE else 'square'
         )
         body_pr_xml = (
-            f'<a:bodyPr wrap="{exact_frame_wrap}" '
+            '<a:bodyPr '
+            f'{_carrier_wrap_attr(exact_frame_wrap, is_placeholder_carrier)}'
             f'lIns="{px_to_emu(left_inset)}" '
             f'tIns="{px_to_emu(top_inset)}" '
             f'rIns="{px_to_emu(right_inset)}" bIns="0" '
-            'anchor="t" anchorCtr="0">\n<a:noAutofit/>\n</a:bodyPr>'
+            'anchor="t" anchorCtr="0">\n'
+            f'{_carrier_autofit("<a:noAutofit/>", is_placeholder_carrier)}'
+            '\n</a:bodyPr>'
         )
     # Preserve mode keeps authored <a:br/> boundaries and lets an ordinary
     # generated text box follow later manual edits, such as deleting a break.
@@ -3557,9 +3673,12 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> ShapeResult | None:
             else '<a:noAutofit/>'
         )
         body_pr_xml = (
-            f'<a:bodyPr wrap="{paragraph_wrap}" '
+            '<a:bodyPr '
+            f'{_carrier_wrap_attr(paragraph_wrap, is_placeholder_carrier)}'
             'lIns="0" tIns="0" rIns="0" bIns="0" '
-            f'anchor="t" anchorCtr="0">\n{paragraph_autofit}\n</a:bodyPr>'
+            'anchor="t" anchorCtr="0">\n'
+            f'{_carrier_autofit(paragraph_autofit, is_placeholder_carrier)}'
+            '\n</a:bodyPr>'
         )
     else:
         body_pr_xml = (
@@ -5055,6 +5174,12 @@ _NESTED_CROP_OUTER_ATTRIBUTES = frozenset({
     'data-pptx-shape-id',
     'data-pptx-shape-name',
     'data-pptx-shape-scope',
+    # Canonical placeholder identity, carried when a crop wrapper is itself the
+    # placeholder carrier so the slot still rebuilds <p:ph>.
+    'data-ph-type',
+    'data-pptx-placeholder-index',
+    'data-pptx-placeholder-size',
+    'data-pptx-placeholder-orientation',
     'id',
     'overflow',
     'preserveAspectRatio',

@@ -732,10 +732,10 @@ def _local_pptx_structure_errors(
             binding = (
                 elem.get('data-pptx-binding') or 'carrier'
             ).strip().lower()
-            if binding not in {'carrier', 'proxy'}:
+            if binding not in {'carrier', 'proxy', 'empty'}:
                 errors.append(
                     f"{svg_path.name}: placeholder slot {element_id} has unknown "
-                    f"binding {binding!r}; use carrier or proxy"
+                    f"binding {binding!r}; use carrier, proxy or empty"
                 )
             carrier_descendants = [
                 child for child in elem.iter()
@@ -764,6 +764,23 @@ def _local_pptx_structure_errors(
                     f"{svg_path.name}: placeholder slot {element_id} has nested "
                     f"carrier marker(s): {names}; the carrier must be a direct child"
                 )
+            if binding == 'empty':
+                if len(visual_children) != 1 or len(direct_carriers) != 1:
+                    errors.append(
+                        f"{svg_path.name}: unbound placeholder slot {element_id} "
+                        "requires exactly one empty <text> child, marked "
+                        "data-pptx-carrier=\"true\""
+                    )
+                elif direct_carriers[0].tag.rsplit('}', 1)[-1] != 'text':
+                    errors.append(
+                        f"{svg_path.name}: unbound placeholder slot {element_id} "
+                        "must be carried by an empty <text> child"
+                    )
+                elif ''.join(direct_carriers[0].itertext()).strip():
+                    errors.append(
+                        f"{svg_path.name}: unbound placeholder slot {element_id} "
+                        "must not carry text content"
+                    )
             if binding == 'carrier':
                 if len(visual_children) != 1 or len(direct_carriers) != 1:
                     errors.append(
@@ -772,11 +789,6 @@ def _local_pptx_structure_errors(
                         "data-pptx-carrier=\"true\""
                     )
             if binding == 'proxy':
-                if placeholder != 'object':
-                    errors.append(
-                        f"{svg_path.name}: proxy binding is allowed only for an "
-                        f"object placeholder, not {placeholder!r}"
-                    )
                 if carrier_descendants:
                     errors.append(
                         f"{svg_path.name}: proxy placeholder slot {element_id} must "

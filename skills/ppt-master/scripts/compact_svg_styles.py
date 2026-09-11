@@ -346,6 +346,12 @@ def _promote_common_group_defaults(
     if _local_name(element.tag) != "g":
         return
 
+    if element.get("data-pptx-placeholder") is not None:
+        # A structured slot wrapper must stay render-neutral: it may carry only
+        # its id and data-pptx-* metadata, so presentation attributes cannot be
+        # factored onto it even when every child agrees.
+        return
+
     children = [
         child for child in element
         if isinstance(child.tag, str)

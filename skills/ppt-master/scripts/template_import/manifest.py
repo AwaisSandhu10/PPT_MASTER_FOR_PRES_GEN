@@ -32,6 +32,13 @@ from pptx_to_svg.ooxml_loader import (
     blip_embed_relationship_ids,
     parse_ooxml_boolean,
 )
+from pptx_to_svg.shape_walker import (
+    CONNECTOR,
+    GRAPHIC,
+    GROUP,
+    PICTURE,
+    walk_sp_tree,
+)
 from pptx_workspace import (
     inventory_package_resources,
     write_workspace_resources,
@@ -89,6 +96,7 @@ def summarize_part_record(
     theme_path: str | None = None,
     svg_file: str | None = None,
     theme: dict[str, Any] | None = None,
+    master_root: ET.Element | None = None,
 ) -> dict[str, Any] | None:
     if not part_path:
         return None
@@ -114,7 +122,7 @@ def summarize_part_record(
             copied_assets.get(target, PurePosixPath(target).name)
             for target in shape_image_targets
         ],
-        "placeholders": extract_placeholders(root),
+        "placeholders": extract_placeholders(root, master_root=master_root),
         "textSamples": extract_text_samples(root),
         "textCount": len(root.findall(".//a:t", NS)) if root is not None else 0,
         "shapeCount": count_slide_shapes(root),
@@ -199,29 +207,6 @@ def resolve_first_rel(
     return None
 
 
-def parse_xfrm_record(sp: ET.Element) -> dict[str, int] | None:
-    xfrm = sp.find("p:spPr/a:xfrm", NS)
-    if xfrm is None:
-        return None
-    off = xfrm.find("a:off", NS)
-    ext = xfrm.find("a:ext", NS)
-    if off is None or ext is None:
-        return None
-    try:
-        x = int(off.attrib.get("x", "0"))
-        y = int(off.attrib.get("y", "0"))
-        w = int(ext.attrib.get("cx", "0"))
-        h = int(ext.attrib.get("cy", "0"))
-    except ValueError:
-        return None
-    return {
-        "x": emu_to_pixels(x),
-        "y": emu_to_pixels(y),
-        "width": emu_to_pixels(w),
-        "height": emu_to_pixels(h),
-    }
-
-
 def part_display_name(root: ET.Element | None, part_path: str) -> str:
     """Return the PowerPoint picker name, falling back to the package stem."""
     if root is not None:
@@ -252,32 +237,158 @@ def placeholder_semantic_role(placeholder_type: str | None) -> str:
         "dt": "date",
         "ftr": "footer",
         "sldNum": "slide-number",
+        # Remaining ST_PlaceholderType values. They have no dedicated slot role,
+        # so they map onto the nearest one that preserves fill behaviour rather
+        # than falling through to "other", which the materializer rejects.
+        "clipArt": "picture",
+        "sldImg": "picture",
+        "dgm": "object",
+        "hdr": "body",
     }
     return role_by_type.get(normalized, "other")
 
 
-def extract_placeholders(root: ET.Element | None) -> list[dict[str, Any]]:
+class UnsupportedPlaceholderHostError(RuntimeError):
+    """A <p:ph> sits on a shape kind the template contract cannot bind."""
+
+
+# <p:ph> is legal on p:sp, p:pic, p:graphicFrame, p:grpSp and p:cxnSp. The
+# first three are bindable slots; the last two are detected and rejected rather
+# than silently mis-bound.
+_UNSUPPORTED_PLACEHOLDER_HOSTS = {GROUP, CONNECTOR}
+
+_TABLE_URI = "http://schemas.openxmlformats.org/drawingml/2006/table"
+_DIAGRAM_URI = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+_CHART_URIS = {
+    "http://schemas.openxmlformats.org/drawingml/2006/chart",
+    "http://schemas.microsoft.com/office/drawing/2014/chartex",
+}
+
+
+def _iter_shape_nodes(nodes):
+    """Yield every walked node, descending into groups."""
+    for node in nodes:
+        yield node
+        if node.children:
+            yield from _iter_shape_nodes(node.children)
+
+
+def _placeholder_type_by_idx(root: ET.Element | None) -> dict[str, str]:
+    """Map placeholder idx to the type declared for it in one part."""
+    table: dict[str, str] = {}
+    if root is None:
+        return table
+    for node in _iter_shape_nodes(walk_sp_tree(root)):
+        ph = node.placeholder
+        if ph is None or ph.idx is None or not ph.type:
+            continue
+        table.setdefault(ph.idx, ph.type)
+    return table
+
+
+def _resolved_placeholder_type(ph, inherited_types: dict[str, str]) -> str | None:
+    """Resolve a slide placeholder's type through its layout/master by idx.
+
+    A slide writes <p:ph idx="13"/> with no type when the slot is unmoved; the
+    declared type lives on the layout. Without this the record defaults to
+    "obj" and never matches its own layout slot.
+    """
+    if ph.type:
+        return ph.type
+    if ph.idx is not None:
+        return inherited_types.get(ph.idx)
+    return None
+
+
+def _graphic_frame_uri(element: ET.Element) -> str:
+    data = element.find("a:graphic/a:graphicData", NS)
+    return (data.attrib.get("uri") or "") if data is not None else ""
+
+
+def _placeholder_content_state(node) -> str:
+    """Return "empty" or "populated" for a placeholder record that exists.
+
+    Structural, never text-based: PowerPoint stores layout prompt strings as
+    real <a:t>, so text presence alone cannot separate the two states.
+
+    "absent" is deliberately not representable. A slide that omits a
+    placeholder has no record to carry a state; that case is resolved against
+    the layout roster by the materializer.
+    """
+    element = node.xml
+    if node.kind == GRAPHIC:
+        uri = _graphic_frame_uri(element)
+        if uri == _TABLE_URI:
+            return "populated" if element.find(".//a:tbl", NS) is not None else "empty"
+        if uri in _CHART_URIS or uri == _DIAGRAM_URI:
+            return "populated"
+        return "populated" if len(element) else "empty"
+    if node.kind == PICTURE:
+        return "populated" if element.find(".//a:blip", NS) is not None else "empty"
+    if element.find(".//a:blip", NS) is not None:
+        return "populated"
+    if any((node.text or "").strip() for node in element.iter(f"{{{NS['a']}}}t")):
+        return "populated"
+    return "empty"
+
+
+def _geometry_record(xfrm) -> dict[str, int] | None:
+    if xfrm is None or xfrm.w <= 0 or xfrm.h <= 0:
+        return None
+    return {
+        "x": int(round(xfrm.x)),
+        "y": int(round(xfrm.y)),
+        "width": int(round(xfrm.w)),
+        "height": int(round(xfrm.h)),
+    }
+
+
+def extract_placeholders(
+    root: ET.Element | None,
+    *,
+    layout_root: ET.Element | None = None,
+    master_root: ET.Element | None = None,
+) -> list[dict[str, Any]]:
+    """Return every <p:ph> record in one part, whatever element hosts it.
+
+    Walking only p:sp loses populated picture, chart and table placeholders,
+    which PowerPoint stores as p:pic and p:graphicFrame. Pass the ancestor
+    parts so geometry and typeless placeholder types resolve the way
+    PowerPoint resolves them.
+    """
     if root is None:
         return []
+    inherited_types = _placeholder_type_by_idx(layout_root)
+    for idx, ph_type in _placeholder_type_by_idx(master_root).items():
+        inherited_types.setdefault(idx, ph_type)
     placeholders: list[dict[str, Any]] = []
-    for sp in root.findall(".//p:sp", NS):
-        ph = sp.find("p:nvSpPr/p:nvPr/p:ph", NS)
+    walked = walk_sp_tree(root, layout_xml=layout_root, master_xml=master_root)
+    for node in _iter_shape_nodes(walked):
+        ph = node.placeholder
         if ph is None:
             continue
-        non_visual = sp.find("p:nvSpPr/p:cNvPr", NS)
-        placeholder_type = ph.attrib.get("type")
+        if node.kind in _UNSUPPORTED_PLACEHOLDER_HOSTS:
+            raise UnsupportedPlaceholderHostError(
+                f"placeholder idx={ph.idx!r} type={ph.type!r} is hosted by "
+                f"<p:{node.kind}>, which the template placeholder contract "
+                "cannot bind to a slot"
+            )
+        resolved_type = _resolved_placeholder_type(ph, inherited_types)
         record: dict[str, Any] = {
-            "type": placeholder_type,
-            "idx": ph.attrib.get("idx"),
-            "size": ph.attrib.get("sz"),
-            "orient": ph.attrib.get("orient"),
-            "semanticRole": placeholder_semantic_role(placeholder_type),
-            "shapeId": non_visual.attrib.get("id") if non_visual is not None else None,
-            "shapeName": non_visual.attrib.get("name") if non_visual is not None else None,
-            "geometry": parse_xfrm_record(sp),
-            "textSamples": extract_text_samples(sp, limit=2),
+            "type": ph.type,
+            "resolvedType": resolved_type,
+            "idx": ph.idx,
+            "size": ph.sz,
+            "orient": ph.orient,
+            "semanticRole": placeholder_semantic_role(resolved_type),
+            "host": node.kind,
+            "contentState": _placeholder_content_state(node),
+            "shapeId": node.spid or None,
+            "shapeName": node.name or None,
+            "geometry": _geometry_record(node.xfrm),
+            "textSamples": extract_text_samples(node.xml, limit=2),
         }
-        style = extract_placeholder_text_style(sp)
+        style = extract_placeholder_text_style(node.xml)
         if style:
             record["textStyle"] = style
         placeholders.append(record)
@@ -288,24 +399,7 @@ def count_drawable_shapes(root: ET.Element | None) -> int:
     """Count top-level visual shapes that are not placeholder definitions."""
     if root is None:
         return 0
-    sp_tree = root.find("p:cSld/p:spTree", NS)
-    if sp_tree is None:
-        return 0
-    visual_tags = {
-        f"{{{NS['p']}}}sp",
-        f"{{{NS['p']}}}grpSp",
-        f"{{{NS['p']}}}graphicFrame",
-        f"{{{NS['p']}}}pic",
-        f"{{{NS['p']}}}cxnSp",
-    }
-    count = 0
-    for child in sp_tree:
-        if child.tag not in visual_tags:
-            continue
-        if child.find("p:nvSpPr/p:nvPr/p:ph", NS) is not None:
-            continue
-        count += 1
-    return count
+    return sum(1 for node in walk_sp_tree(root) if node.placeholder is None)
 
 
 def extract_placeholder_text_style(sp: ET.Element) -> dict[str, Any]:
@@ -616,7 +710,11 @@ def build_manifest(
             image_targets = extract_image_targets(slide_root, slide_rels)
             texts = extract_text_samples(slide_root)
             shape_count = count_slide_shapes(slide_root)
-            placeholders = extract_placeholders(slide_root)
+            placeholders = extract_placeholders(
+                slide_root,
+                layout_root=layout_root,
+                master_root=master_root,
+            )
             page_type = classify_slide(index, len(slide_parts), texts, len(image_targets), shape_count)
 
             resolved_bg = copied_assets.get(bg_asset, PurePosixPath(bg_asset).name if bg_asset else None)
@@ -716,6 +814,11 @@ def build_manifest(
                 used_by_slides=layout_usage[layout_path],
                 parent_path=layout_cache[layout_path]["master_path"],
                 svg_file=part_svg_filename("layout", seq, layout_path),
+                master_root=(
+                    master_cache.get(
+                        layout_cache[layout_path]["master_path"] or "", {},
+                    ).get("root")
+                ),
             )
             for seq, layout_path in enumerate(layout_parts, start=1)
             if layout_path in layout_cache

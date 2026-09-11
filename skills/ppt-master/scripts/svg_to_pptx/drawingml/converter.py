@@ -819,6 +819,12 @@ def _convert_semantic_shape(
                 'data-pptx-geometry-kind',
                 'data-pptx-object',
                 'data-pptx-prst',
+                # Canonical placeholder identity: without these the collapsed
+                # carrier cannot rebuild <p:ph> in _imported_placeholder_xml.
+                'data-ph-type',
+                'data-pptx-placeholder-index',
+                'data-pptx-placeholder-size',
+                'data-pptx-placeholder-orientation',
             }
             or name.startswith('data-pptx-av-')
         ) and carrier.get(name) is None:

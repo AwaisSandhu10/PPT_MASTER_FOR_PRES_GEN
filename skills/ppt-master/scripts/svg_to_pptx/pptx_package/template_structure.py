@@ -119,6 +119,10 @@ _OBJECT_PLACEHOLDER_TAGS = frozenset({
     "svg",
     "use",
 })
+# Public alias: the mirror materializer decides carrier-vs-proxy binding from
+# the same vocabulary this module validates against.
+OBJECT_PLACEHOLDER_TAGS = _OBJECT_PLACEHOLDER_TAGS
+
 _LAYOUT_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _MASTER_KEY_RE = _LAYOUT_KEY_RE
 # Parse Markdown row syntax before validating each section's key grammar. Keeping
@@ -128,7 +132,11 @@ _LOCK_PAGE_RE = re.compile(r"^P(\d+)$")
 PPTX_STRUCTURE_MODES = frozenset({"structured", "preserve", "flat"})
 TEMPLATE_ADHERENCE_MODES = frozenset({"strict", "adaptive"})
 TEMPLATE_REUSE_SCOPES = frozenset({"mirror", "layout", "style"})
-PLACEHOLDER_BINDING_MODES = frozenset({"carrier", "proxy"})
+# "carrier" binds one visible child as the placeholder; "proxy" keeps
+# composite content ordinary and adds a hidden binding shape; "empty"
+# declares a native placeholder the source left unfilled, which is a valid
+# reusable slot and must not be forced to invent artwork or a native marker.
+PLACEHOLDER_BINDING_MODES = frozenset({"carrier", "proxy", "empty"})
 SOURCE_THEMES_FILENAME = "source_themes.json"
 SOURCE_THEMES_SCHEMA = "ppt-master.source-themes.v1"
 _DML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -309,6 +317,10 @@ class TemplateElementSpec:
     placeholder_idx: int | None = None
     placeholder_binding: str | None = None
     placeholder_carrier_tag: str | None = None
+    # (scope, bodyPr XML) per inheritance level, nearest first. Deliberately
+    # unresolved, and deliberately absent from contract_signature: the slide
+    # level may legitimately differ between slides sharing one layout.
+    placeholder_body_properties: tuple[tuple[str, str], ...] = ()
     is_background: bool = False
 
     def contract_signature(self) -> tuple[object, ...]:
@@ -1408,14 +1420,89 @@ def _parse_placeholder_idx(
     return parsed
 
 
+PLACEHOLDER_BODY_PR_SCOPES = ("slide", "layout", "master")
+
+
+def _parse_placeholder_body_properties(
+    elem: ET.Element,
+    *,
+    svg_path: Path,
+    element_id: str,
+) -> tuple[tuple[str, str], ...]:
+    """Read the imported bodyPr inheritance chain off one slot.
+
+    Returned nearest-first so the caller can apply a level without having to
+    know how many levels the source declared.
+    """
+    found: dict[str, str] = {}
+    for child in elem:
+        if (
+            _local_tag(child) != "metadata"
+            or child.get("data-pptx-part") != "placeholder-bodypr"
+        ):
+            continue
+        scope = child.get("data-pptx-scope") or ""
+        if scope not in PLACEHOLDER_BODY_PR_SCOPES:
+            raise TemplateStructureError(
+                f"{svg_path.name}: {element_id} placeholder-bodypr has "
+                f"unsupported data-pptx-scope {scope!r}; expected one of "
+                + ", ".join(PLACEHOLDER_BODY_PR_SCOPES)
+            )
+        if child.get("data-pptx-encoding") != "base64":
+            raise TemplateStructureError(
+                f"{svg_path.name}: {element_id} placeholder-bodypr must "
+                "declare data-pptx-encoding='base64'"
+            )
+        try:
+            raw = base64.b64decode((child.text or "").strip(), validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise TemplateStructureError(
+                f"{svg_path.name}: {element_id} placeholder-bodypr payload is "
+                f"not valid base64: {exc}"
+            ) from exc
+        digest = child.get("data-pptx-ooxml-sha256")
+        if digest and hashlib.sha256(raw).hexdigest() != digest:
+            raise TemplateStructureError(
+                f"{svg_path.name}: {element_id} placeholder-bodypr payload "
+                "does not match its data-pptx-ooxml-sha256"
+            )
+        if scope in found:
+            raise TemplateStructureError(
+                f"{svg_path.name}: {element_id} declares more than one "
+                f"placeholder-bodypr for scope {scope!r}"
+            )
+        found[scope] = raw.decode("utf-8")
+    return tuple(
+        (scope, found[scope])
+        for scope in PLACEHOLDER_BODY_PR_SCOPES
+        if scope in found
+    )
+
+
 def _validate_placeholder_carrier(
     carrier: ET.Element,
     placeholder: str,
     *,
+    binding: str,
     svg_path: Path,
     element_id: str,
 ) -> None:
     tag = _local_tag(carrier)
+    if binding == "empty":
+        # The role stays on the wrapper and still drives <p:ph type>, so an
+        # unfilled slot of any role materializes as the empty text shape
+        # PowerPoint itself writes for an unfilled placeholder.
+        if tag != "text":
+            raise TemplateStructureError(
+                f"{svg_path.name}: {element_id} unbound placeholder "
+                f"'{placeholder}' must be carried by one empty <text> child"
+            )
+        if "".join(carrier.itertext()).strip():
+            raise TemplateStructureError(
+                f"{svg_path.name}: {element_id} unbound placeholder "
+                f"'{placeholder}' must not carry text content"
+            )
+        return
     if placeholder in _TEXT_PLACEHOLDERS and tag != "text":
         raise TemplateStructureError(
             f"{svg_path.name}: {element_id} placeholder '{placeholder}' must be "
@@ -1816,11 +1903,6 @@ def parse_template_slide(
                             "metadata: " + ", ".join(nested_attrs)
                         )
             if placeholder_binding == "proxy":
-                if placeholder != "object":
-                    raise TemplateStructureError(
-                        f"{svg_path.name}: placeholder {element_id!r} may use proxy "
-                        "binding only with data-pptx-placeholder='object'"
-                    )
                 if carrier_children:
                     raise TemplateStructureError(
                         f"{svg_path.name}: proxy placeholder {element_id!r} must not "
@@ -1851,6 +1933,7 @@ def parse_template_slide(
                 _validate_placeholder_carrier(
                     carrier,
                     placeholder,
+                    binding=placeholder_binding,
                     svg_path=svg_path,
                     element_id=element_id,
                 )
@@ -1860,6 +1943,7 @@ def parse_template_slide(
             _validate_placeholder_carrier(
                 elem,
                 placeholder,
+                binding=placeholder_binding,
                 svg_path=svg_path,
                 element_id=element_id,
             )
@@ -1886,6 +1970,11 @@ def parse_template_slide(
                 placeholder_idx=placeholder_idx,
                 placeholder_binding=placeholder_binding,
                 placeholder_carrier_tag=placeholder_carrier_tag,
+                placeholder_body_properties=_parse_placeholder_body_properties(
+                    elem,
+                    svg_path=svg_path,
+                    element_id=element_id,
+                ),
                 is_background=is_background,
             ))
         visual_order += 1

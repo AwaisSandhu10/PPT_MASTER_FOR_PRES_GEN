@@ -61,6 +61,14 @@ class PlaceholderInfo:
     orient: str | None = None
 
 
+@dataclass(frozen=True)
+class ScopedBodyPr:
+    """One <a:bodyPr> tagged with the part that declared it."""
+
+    scope: str  # "layout" or "master"
+    body_pr: ET.Element
+
+
 @dataclass
 class ShapeNode:
     """Normalized shape entry produced by the walker."""
@@ -75,7 +83,7 @@ class ShapeNode:
     hyperlink_action: str = ""
     placeholder: PlaceholderInfo | None = None
     inherited_lst_styles: tuple[ET.Element, ...] = ()
-    inherited_body_properties: tuple[ET.Element, ...] = ()
+    inherited_body_properties: tuple[ScopedBodyPr, ...] = ()
     # Local plus ancestor group rotation; used for effect-fidelity decisions
     # without applying the group transform twice to the rendered geometry.
     effective_rotation: float = 0.0
@@ -259,7 +267,7 @@ def _walk_container(
     ] | None = None,
     placeholder_body_properties: dict[
         tuple[str | None, str | None],
-        list[ET.Element],
+        list[ScopedBodyPr],
     ] | None = None,
 ) -> list[ShapeNode]:
     """Walk a p:spTree or p:grpSp subtree. Children kept in document (z) order.
@@ -396,8 +404,8 @@ def _lookup_placeholder_lst_styles(
 
 def _lookup_placeholder_body_properties(
     ph: PlaceholderInfo,
-    table: dict[tuple[str | None, str | None], list[ET.Element]],
-) -> tuple[ET.Element, ...]:
+    table: dict[tuple[str | None, str | None], list[ScopedBodyPr]],
+) -> tuple[ScopedBodyPr, ...]:
     """Find inherited txBody/bodyPr elements for a placeholder."""
     ph_type, ph_idx = _placeholder_identity(ph.type, ph.idx)
     exact = table.get((ph_type, ph_idx), [])
@@ -504,11 +512,15 @@ def _build_placeholder_lst_style_table(
 
 
 def _build_placeholder_body_property_table(
-    *parts: ET.Element | None,
-) -> dict[tuple[str | None, str | None], list[ET.Element]]:
-    """Index placeholder txBody/bodyPr elements in priority order."""
-    table: dict[tuple[str | None, str | None], list[ET.Element]] = {}
-    for part_xml in parts:
+    *parts: tuple[str, ET.Element | None],
+) -> dict[tuple[str | None, str | None], list[ScopedBodyPr]]:
+    """Index placeholder txBody/bodyPr elements in priority order.
+
+    Each entry keeps the part it came from so a consumer can rebuild the
+    inheritance chain instead of only its resolved merge.
+    """
+    table: dict[tuple[str | None, str | None], list[ScopedBodyPr]] = {}
+    for scope, part_xml in parts:
         if part_xml is None:
             continue
         sp_tree = part_xml.find("p:cSld/p:spTree", NS)
@@ -530,7 +542,7 @@ def _build_placeholder_body_property_table(
                 (ph_type, None),
                 (None, ph_idx),
             ):
-                table.setdefault(key, []).append(body_pr)
+                table.setdefault(key, []).append(ScopedBodyPr(scope, body_pr))
     return table
 
 
@@ -569,8 +581,8 @@ def walk_sp_tree(
         layout_xml, master_xml,
     )
     placeholder_body_properties = _build_placeholder_body_property_table(
-        layout_xml,
-        master_xml,
+        ("layout", layout_xml),
+        ("master", master_xml),
     )
     return _walk_container(
         sp_tree, parent_group_xfrm=None,

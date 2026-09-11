@@ -631,6 +631,18 @@ def _make_geometry_carrier_visible(element: ET.Element) -> int:
     return changed
 
 
+def _semantic_text_indent(source: ET.Element, parent: ET.Element) -> float:
+    """How far right of the merged body a row starts, clamped at zero."""
+    try:
+        source_x = float(source.get("x", ""))
+        parent_x = float(parent.get("x", ""))
+    except ValueError:
+        return 0.0
+    if not (math.isfinite(source_x) and math.isfinite(parent_x)):
+        return 0.0
+    return max(source_x - parent_x, 0.0)
+
+
 def _semantic_text_baseline(element: ET.Element) -> float:
     raw = element.get("y")
     if raw is None:
@@ -736,6 +748,7 @@ def _semantic_paragraph_from_text(
     parent: ET.Element,
     *,
     space_before: float,
+    indent: float = 0.0,
 ) -> ET.Element:
     """Wrap one rendered SVG text line as one semantic paragraph run tree."""
     paragraph = ET.Element(f"{{{SVG_NS}}}tspan")
@@ -755,6 +768,11 @@ def _semantic_paragraph_from_text(
         paragraph.set(
             "data-paragraph-space-before",
             f"{space_before:.6f}".rstrip("0").rstrip("."),
+        )
+    if indent > 0:
+        paragraph.set(
+            "data-paragraph-indent",
+            f"{indent:.6f}".rstrip("0").rstrip("."),
         )
     paragraph.text = source.text
     for child in source:
@@ -799,6 +817,7 @@ def _merge_semantic_shape_texts(
                 source,
                 combined,
                 space_before=space_before,
+                indent=_semantic_text_indent(source, combined),
             )
         )
         previous_baseline = baseline

@@ -190,6 +190,9 @@ PARAGRAPH_SOFT_BREAK_ATTR = "data-paragraph-soft-break"
 # Marks an authored visual line boundary that remains a hard DrawingML break
 # in the default single-frame preserve mode.
 PARAGRAPH_LINE_BREAK_ATTR = "data-paragraph-line-break"
+# Horizontal offset in px from the frame's own x, for a line the source indented
+# by moving x. DrawingML carries it as <a:pPr marL="...">, a paragraph property.
+PARAGRAPH_INDENT_ATTR = "data-paragraph-indent"
 INLINE_FORMULA_ATTR = "data-pptx-inline-formula"
 
 # Tolerance for detecting "base line-height" vs "paragraph gap": dy values
@@ -315,6 +318,29 @@ def _effective_line_font_size_px(
     return parent_size if parent_size is not None else 16.0
 
 
+def _same_x(left: float | None, right: float | None) -> bool:
+    """Whether two line origins are the same column."""
+    if left is None or right is None:
+        return left is right
+    return abs(left - right) <= 1e-6
+
+
+def _line_indent_px(text_el: ET.Element, line: ET.Element) -> float:
+    """One line's indent from its frame origin, clamped at zero.
+
+    ST_TextMargin is non-negative, and a line starting left of its own frame
+    is not an indent.
+    """
+    base_x = parse_first_number(get_attr(text_el, "x"))
+    line_x_raw = get_attr(line, "x")
+    if base_x is None or line_x_raw is None:
+        return 0.0
+    line_x = parse_first_number(line_x_raw)
+    if line_x is None:
+        return 0.0
+    return max(line_x - base_x, 0.0)
+
+
 def _classify_paragraph_block(
     text_el: ET.Element,
     is_svg_tag,
@@ -349,7 +375,9 @@ def _classify_paragraph_block(
       - dy values cluster around a single minimum "base line-height";
         any larger dy must be ≤ MAX_DY_MULTIPLIER × base. Anything larger
         is treated as a section break and rejected.
-      - Every line-break tspan that sets x repeats the parent <text>'s x.
+      - Every line-break tspan that sets x has a parent <text> x to measure
+        against; the offset between them becomes the paragraph's left margin,
+        and a change of offset forces a new paragraph.
       - A line-break tspan cannot add a non-zero dx offset.
       - No nested tspan inside any line carries x/y/non-zero dy.
       - Adjacent lines with different effective font sizes start new paragraphs.
@@ -385,6 +413,7 @@ def _classify_paragraph_block(
 
     # First pass: validate per-line structural rules and collect dy values.
     dy_values: list[float] = []  # one per line (0 for first)
+    line_xs: list[float | None] = []  # one per line; None when the line sets no x
     for idx, group in enumerate(line_groups):
         tspan = group[0]
 
@@ -393,10 +422,15 @@ def _classify_paragraph_block(
             return None
 
         t_x_raw = get_attr(tspan, "x")
+        line_x = base_x
         if t_x_raw is not None:
             t_x = parse_first_number(t_x_raw)
-            if base_x is None or t_x is None or abs(t_x - base_x) > 1e-6:
+            # An unparseable x, or one with no frame origin to measure against,
+            # is still unusable: there is nothing to turn into a margin.
+            if base_x is None or t_x is None:
                 return None
+            line_x = t_x
+        line_xs.append(line_x)
         t_dx_raw = get_attr(tspan, "dx")
         t_dx = parse_first_number(t_dx_raw) if t_dx_raw is not None else None
         if t_dx is not None and abs(t_dx) > 1e-6:
@@ -431,10 +465,21 @@ def _classify_paragraph_block(
         for group in line_groups
     ]
     for idx, d in enumerate(dy_values[1:], start=1):
+        explicit_soft_break = line_groups[idx][0].get(
+            PARAGRAPH_SOFT_BREAK_ATTR
+        )
         if d + DY_TOLERANCE_PX < base:
             return None  # below base — line overlap, not a paragraph
-        if d > base * MAX_DY_MULTIPLIER + DY_TOLERANCE_PX:
-            return None  # gap too large — treat as section break
+        if (
+            explicit_soft_break is None
+            and d > base * MAX_DY_MULTIPLIER + DY_TOLERANCE_PX
+        ):
+            # Gap too large to guess at — treat as a section break. An explicit
+            # marker is authoritative evidence that these lines are one text
+            # frame, so it overrides the distance heuristic rather than losing
+            # to it; a placeholder merged from several source blocks can sit
+            # far apart and still be one PowerPoint paragraph block.
+            return None
         extra = d - base
         if extra < 0:
             extra = 0.0
@@ -447,10 +492,12 @@ def _classify_paragraph_block(
             and not _starts_with_list_marker(line_groups[idx])
             and abs(line_font_sizes[idx] - line_font_sizes[idx - 1]) <= 1e-6
         )
-        explicit_soft_break = line_groups[idx][0].get(
-            PARAGRAPH_SOFT_BREAK_ATTR
-        )
-        if explicit_soft_break == "0":
+        indent_changed = not _same_x(line_xs[idx], line_xs[idx - 1])
+        if indent_changed:
+            # marL is a paragraph property, so an indent change cannot happen
+            # inside an <a:p>. This outranks an explicit soft-break marker.
+            break_kind = "paragraph"
+        elif explicit_soft_break == "0":
             break_kind = "paragraph"
         elif explicit_soft_break == "1":
             break_kind = "soft"
@@ -509,6 +556,10 @@ def _emit_mergeable_paragraph(
     # Keeping the authored runs as siblings is important: nesting later runs
     # under the positioned first run would incorrectly inherit its typography,
     # and moving them independently would lose the first run's tail whitespace.
+    # Read indents before normalization: wrapping a multi-run line into a
+    # container pops x off the line that carried it.
+    indents = [_line_indent_px(text_el, group[0]) for group in line_groups]
+
     normalized_lines: list[ET.Element] = []
     for group in line_groups:
         line = group[0]
@@ -530,6 +581,7 @@ def _emit_mergeable_paragraph(
 
     extras_iter = iter(extras)
     break_iter = iter(break_kinds)
+    indent_iter = iter(indents)
     for tspan in normalized_lines:
         for k in ("x", "y", "dx", "dy"):
             if k in tspan.attrib:
@@ -538,8 +590,12 @@ def _emit_mergeable_paragraph(
             PARAGRAPH_SOFT_BREAK_ATTR,
             PARAGRAPH_LINE_BREAK_ATTR,
             PARAGRAPH_SPACE_BEFORE_ATTR,
+            PARAGRAPH_INDENT_ATTR,
         ):
             tspan.attrib.pop(k, None)
+        indent = next(indent_iter, 0.0)
+        if indent > 1e-6:
+            tspan.set(PARAGRAPH_INDENT_ATTR, format_number(indent))
         try:
             extra = next(extras_iter)
             break_kind = next(break_iter)
