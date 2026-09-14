@@ -41,6 +41,13 @@ _OPENING_PUNCTUATION = frozenset('([{（《「『【“‘')
 _PREFERRED_BREAK_PUNCTUATION = frozenset('，。；：')
 _LATIN_TOKEN_CONNECTORS = frozenset("'’._:/+%@#-")
 _WEIGHTS = ('normal', 'bold', '100', '200', '300', '400', '500', '600', '700', '800', '900')
+
+# Style fields read by the estimator; reject unknown keys to catch typos.
+_RUN_STYLE_FIELDS = frozenset({
+    'text', 'font_size', 'font_family', 'font_weight', 'font_style', 'letter_spacing',
+})
+# get_font_advances treats only these as italic; anything else measures upright.
+_STYLES = ('normal', 'italic', 'oblique')
 _CALIBRATION_CJK_SAMPLE = '天地玄黄宇宙洪荒日月盈昃辰宿列张寒来暑往'
 _CALIBRATION_LATIN_SAMPLE = 'Clear Slides Make Big Ideas Easy to See.'
 _CALIBRATION_CAPS_SAMPLE = 'CLEAR SLIDES MAKE BIG IDEAS EASY TO SEE.'
@@ -100,6 +107,79 @@ def measure_text(
         [run],
         include_headroom=include_headroom,
     )
+
+
+def measure_runs(runs: list[dict], *, include_headroom: bool = True) -> float:
+    """Measure one mixed-format line the way the checker scores it."""
+    return estimate_single_line_text_frame_width(
+        runs,
+        include_headroom=include_headroom,
+    )
+
+
+def _normalize_run(raw: object, index: int, defaults: dict) -> dict:
+    """Fill a run's omitted style fields from the shared style arguments."""
+    if not isinstance(raw, dict):
+        raise ValueError(f'run {index} must be a JSON object')
+    unknown = set(raw) - _RUN_STYLE_FIELDS
+    if unknown:
+        raise ValueError(
+            f'run {index} has unsupported field(s): {", ".join(sorted(unknown))}'
+        )
+    if 'text' not in raw:
+        raise ValueError(f'run {index} has no "text"')
+    run = dict(defaults)
+    run.update({key: value for key, value in raw.items() if value is not None})
+    run['text'] = str(run['text'])
+    if run.get('font_family') is None:
+        raise ValueError(
+            f'run {index} has no "font_family" and no --family fallback'
+        )
+    run['font_family'] = str(run['font_family'])
+    run['font_weight'] = str(run['font_weight'])
+    run['font_style'] = str(run['font_style'])
+    if run['font_weight'] not in _WEIGHTS:
+        raise ValueError(
+            f'run {index} "font_weight" must be one of {", ".join(_WEIGHTS)}'
+        )
+    if run['font_style'] not in _STYLES:
+        raise ValueError(
+            f'run {index} "font_style" must be one of {", ".join(_STYLES)}'
+        )
+    try:
+        size = float(run['font_size'])
+        spacing = float(run['letter_spacing'])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f'run {index} needs a numeric "font_size"; pass it per run or as --size'
+        ) from exc
+    if not math.isfinite(size) or size <= 0:
+        raise ValueError(f'run {index} "font_size" must be positive and finite')
+    if not math.isfinite(spacing):
+        raise ValueError(f'run {index} "letter_spacing" must be finite')
+    run['font_size'], run['letter_spacing'] = size, spacing
+    return run
+
+
+def _parse_run_lines(payload: str, defaults: dict) -> list[list[dict]]:
+    """Accept one runs array or an array of runs arrays; normalize both."""
+    try:
+        data = json.loads(payload)
+    except ValueError as exc:
+        raise ValueError(f'--runs is not valid JSON: {exc}') from exc
+    if not isinstance(data, list) or not data:
+        raise ValueError('--runs needs a non-empty JSON array')
+    lines = data if isinstance(data[0], list) else [data]
+    normalized: list[list[dict]] = []
+    for line_index, line in enumerate(lines):
+        if not isinstance(line, list) or not line:
+            raise ValueError(
+                f'line {line_index} must be a non-empty array of run objects'
+            )
+        normalized.append(
+            [_normalize_run(run, index, defaults) for index, run in enumerate(line)]
+        )
+    return normalized
 
 
 def _is_latin_or_number_cluster(cluster: str) -> bool:
@@ -638,8 +718,8 @@ def _run_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
-def _add_style_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument('--size', type=_positive_float, required=True)
+def _add_style_arguments(parser: argparse.ArgumentParser, *, size_required: bool = True) -> None:
+    parser.add_argument('--size', type=_positive_float, required=size_required)
     parser.add_argument('--family', default='Calibri')
     parser.add_argument('--weight', choices=_WEIGHTS, default='normal')
     parser.add_argument('--letter-spacing', type=_bounded_float, default=0.0)
@@ -659,6 +739,13 @@ def build_parser() -> argparse.ArgumentParser:
     measure = subparsers.add_parser('measure', help='Measure single-line text.')
     measure.add_argument('text', metavar='TEXT', nargs='*')
     measure.add_argument('--stdin', action='store_true')
+    measure.add_argument(
+        '--runs',
+        metavar='JSON',
+        help='Mixed-format line(s) as run objects: one runs array, or an array '
+             'of them. Omitted run fields fall back to the style arguments.',
+    )
+    measure.add_argument('--runs-stdin', action='store_true')
 
     wrap = subparsers.add_parser('wrap', help='Wrap one paragraph.')
     wrap.add_argument('text', metavar='TEXT', nargs='?')
@@ -692,8 +779,47 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument('--json', action='store_true')
     for command in (measure, wrap, box):
         command.add_argument('--json', action='store_true')
-        _add_style_arguments(command)
+        _add_style_arguments(command, size_required=command is not measure)
     return parser
+
+
+def _run_measure_runs(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Measure mixed-format lines supplied as run objects."""
+    if args.runs is not None and args.runs_stdin:
+        parser.error('measure accepts --runs or --runs-stdin, not both')
+    if args.text or args.stdin:
+        parser.error('measure accepts TEXT/--stdin or --runs/--runs-stdin, not both')
+    defaults = dict(
+        font_size=args.size,
+        font_family=args.family,
+        font_weight=args.weight,
+        font_style='normal',
+        letter_spacing=args.letter_spacing,
+    )
+    try:
+        lines = _parse_run_lines(
+            sys.stdin.read() if args.runs_stdin else args.runs,
+            defaults,
+        )
+    except ValueError as exc:
+        print(f'measure failed: {exc}', file=sys.stderr)
+        return 2
+    include_headroom = not args.no_headroom
+    results = [
+        {
+            'text': ''.join(run['text'] for run in runs),
+            'runs': len(runs),
+            'width': measure_runs(runs, include_headroom=include_headroom),
+        }
+        for runs in lines
+    ]
+    if args.json:
+        print(json.dumps(results, ensure_ascii=False))
+    else:
+        sys.stdout.write(
+            ''.join(f'{item["width"]:.1f}\t{item["text"]}\n' for item in results)
+        )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -702,6 +828,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == 'calibrate':
         return _run_calibrate(args)
+    if args.command == 'measure' and (args.runs is not None or args.runs_stdin):
+        return _run_measure_runs(args, parser)
+    if args.size is None:
+        parser.error('--size is required unless measure is given --runs/--runs-stdin')
     style = dict(
         size=args.size,
         family=args.family,

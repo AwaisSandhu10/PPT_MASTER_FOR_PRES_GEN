@@ -23,6 +23,7 @@ from text_measure import (  # noqa: E402
     _CLOSING_PUNCTUATION,
     _OPENING_PUNCTUATION,
     _render_wrapped_svg,
+    measure_runs,
     measure_text,
     text_box,
     wrap_text,
@@ -64,6 +65,64 @@ class TextMeasureTests(unittest.TestCase):
         result = _run_cli('measure', SAMPLE, '--size', '22')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, f'736.5\t{SAMPLE}\n')
+
+    def test_runs_measure_matches_checker_estimator(self) -> None:
+        runs = [
+            {
+                'text': 'Sev-1 ', 'font_size': 20.0, 'font_family': 'Arial',
+                'font_weight': 'bold', 'font_style': 'normal', 'letter_spacing': 0.0,
+            },
+            {
+                'text': 'escalates in 15 minutes', 'font_size': 20.0,
+                'font_family': 'Arial', 'font_weight': 'normal',
+                'font_style': 'normal', 'letter_spacing': 0.0,
+            },
+        ]
+        expected = estimate_single_line_text_frame_width(runs)
+        self.assertAlmostEqual(measure_runs(runs), expected)
+
+        payload = json.dumps([
+            {'text': 'Sev-1 ', 'font_weight': 'bold'},
+            {'text': 'escalates in 15 minutes'},
+        ])
+        result = _run_cli(
+            'measure', '--runs', payload,
+            '--size', '20', '--family', 'Arial', '--json',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertAlmostEqual(json.loads(result.stdout)[0]['width'], expected)
+
+    def test_runs_omitted_fields_follow_style_arguments(self) -> None:
+        """One run must measure exactly like the positional form."""
+        for family in ('Arial', 'Calibri', 'Georgia'):
+            with self.subTest(family=family):
+                positional = _run_cli(
+                    'measure', SAMPLE, '--size', '22', '--family', family,
+                )
+                runs = _run_cli(
+                    'measure', '--runs', json.dumps([{'text': SAMPLE}]),
+                    '--size', '22', '--family', family,
+                )
+                self.assertEqual(runs.returncode, 0, runs.stderr)
+                self.assertEqual(
+                    runs.stdout.split('\t')[0], positional.stdout.split('\t')[0],
+                )
+
+    def test_runs_reject_unknown_and_invalid_fields(self) -> None:
+        cases = (
+            ([{'text': 'x', 'fontsize': 12}], 'unsupported field'),
+            ([{'text': 'x', 'font_weight': 'heavy'}], '"font_weight" must be one of'),
+            ([{'text': 'x', 'font_style': 'slanted'}], '"font_style" must be one of'),
+            ([{'nottext': 'x'}], 'unsupported field'),
+        )
+        for payload, expected in cases:
+            with self.subTest(payload=payload):
+                result = _run_cli(
+                    'measure', '--runs', json.dumps(payload),
+                    '--size', '12', '--family', 'Arial',
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(expected, result.stderr)
 
     def test_arial_raw_width_matches_reference_lines(self) -> None:
         cases = (

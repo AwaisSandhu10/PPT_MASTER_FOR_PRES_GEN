@@ -1019,7 +1019,14 @@ bold, italic, and bold-italic styles. Expect other families to keep the
 class-average estimate, with the existing fixed advances for monospaced faces.
 
 - `measure` prints one `width<TAB>text` line per input, or a JSON array with
-  `--json`.
+  `--json`. Pass a whole page's lines in one call with `--stdin`. A line whose
+  formatting changes mid-way — a bold word, a second family, an inline size or
+  style — is measured with `--runs`, which takes one JSON runs array or an array
+  of them; headroom scales per run, so such a line is wider than the same
+  characters as a single uniform run. A run may carry `text`, `font_size`,
+  `font_family`, `font_weight`, `font_style`, and `letter_spacing`; omitted
+  fields fall back to `--size` / `--family` / `--weight` / `--letter-spacing`,
+  and any other key is rejected rather than silently ignored.
 - `wrap` prints greedy word- or CJK-cluster-wrapped SVG text content; `--y`
   includes the outer `<text>` element, and `--json` prints line metrics.
 - `box` prints a `data-pptx-bounds` attribute plus numeric `top` and `bottom`, or
@@ -1047,6 +1054,8 @@ class-average estimate, with the existing fixed advances for monospaced faces.
 
 ```bash
 python3 scripts/text_measure.py measure "Editable DrawingML text" --size 22
+python3 scripts/text_measure.py measure --stdin --json --size 20 --family Arial < page_lines.txt
+python3 scripts/text_measure.py measure --runs '[{"text":"Sev-1 ","font_weight":"bold"},{"text":"escalates in 15 minutes"}]' --size 20 --family Arial
 python3 scripts/text_measure.py wrap "Editable DrawingML text stays measurable" --size 22 --max-width 240 --x 96 --dy 30 --y 140
 python3 scripts/text_measure.py box "First line" "Second line" --x 96 --y 140 --size 22 --lines 2 --dy 30
 python3 scripts/text_measure.py calibrate projects/example --outline
