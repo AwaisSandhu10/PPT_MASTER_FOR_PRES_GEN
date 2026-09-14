@@ -1158,10 +1158,14 @@ class SVGQualityChecker:
         template_mode: bool = False,
         quick_generate: bool = False,
         canonical_authoring: bool = False,
+        quiet: bool = False,
     ):
         self.template_mode = template_mode
         self._image_pixel_sizes: Dict[Path, Tuple[int, int]] = {}
         self.scan_banner = True
+        # Suppresses clean-file lines and the repeated fix-tips block only;
+        # every error, warning, summary and receipt still prints.
+        self.quiet = quiet
         self.quick_generate = quick_generate
         self.canonical_authoring = canonical_authoring
         self.results = []
@@ -8981,6 +8985,9 @@ class SVGQualityChecker:
             icon = "[ERROR]"
             status = "Failed"
 
+        if self.quiet and result['passed'] and not result['warnings']:
+            return
+
         print(f"{icon} {result['file']} - {status}")
 
         # Display basic info
@@ -9066,7 +9073,9 @@ class SVGQualityChecker:
         self._print_source_import_summary()
 
         # Fix suggestions
-        if self.summary['errors'] > 0 or self.summary['warnings'] > 0:
+        if not self.quiet and (
+            self.summary['errors'] > 0 or self.summary['warnings'] > 0
+        ):
             print(f"\n[TIP] Common fixes:")
             print(f"  1. XML well-formedness: write typography as raw Unicode (—, ©, →, NBSP); escape XML reserved chars as &amp; &lt; &gt; &quot; &apos; — never use HTML named entities like &nbsp; &mdash; &copy;")
             print(f"  2. viewBox issues: root viewBox is the canvas authority (see references/canvas-formats.md)")

@@ -154,6 +154,11 @@ def print_usage() -> None:
     print("                                  per-file and cross-page structure validation. Legacy")
     print("                                  native_structure_mode: template fails and must be")
     print("                                  re-created through create-template before validation.")
+    print("  --quiet                        Omit passing-file lines and the repeated fix-tips")
+    print("                                  block. Errors, warnings, the summary and the")
+    print("                                  carrier receipt always print. Never valid at a")
+    print("                                  gate: the route reviews the complete issue set")
+    print("                                  unfiltered (references/executor-base.md \u00a73).")
     print("  Warnings are advisory: they require no modification and do not affect exit status;")
     print("  only errors make the command exit with status 1.")
 
@@ -175,6 +180,7 @@ def main() -> None:
         sys.exit(1)
 
     template_mode = "--template-mode" in sys.argv
+    quiet = "--quiet" in sys.argv
     quick_generate = "--quick-generate" in sys.argv
     canonical_authoring = "--canonical-authoring" in sys.argv
     roundtrip = "--roundtrip" in sys.argv
@@ -191,6 +197,7 @@ def main() -> None:
         template_mode=template_mode,
         quick_generate=quick_generate,
         canonical_authoring=canonical_authoring,
+        quiet=quiet,
     )
 
     target = sys.argv[1]

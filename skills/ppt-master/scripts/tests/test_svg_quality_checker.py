@@ -14,6 +14,9 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+
 from svg_quality import checker as checker_module  # noqa: E402
 from svg_quality.checker import SVGQualityChecker  # noqa: E402
 
@@ -440,3 +443,52 @@ class NoCropStretchMeasurementTests(unittest.TestCase):
             SVGQualityChecker._stretch_deviation(plain, (900, 1600)), 0.0
         )
         self.assertIsNone(SVGQualityChecker._stretch_deviation(nested, None))
+
+
+class QuietOutputTests(unittest.TestCase):
+    """--quiet may drop noise but never a finding, a receipt, or the exit code."""
+
+    CLEAN = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" '
+        'width="1280" height="720" font-family="Arial" font-size="16">'
+        '<rect width="1280" height="720" fill="#FFFFFF"/>'
+        '<g id="body" data-pptx-bounds="80 60 900 120">'
+        '<text x="80" y="120" font-size="24" fill="#334155">Fits its module</text>'
+        '</g></svg>'
+    )
+
+    def _run(self, target: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / 'svg_quality_checker.py'),
+                str(target),
+                *extra,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_quiet_drops_only_passing_lines_and_keeps_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / '01_clean.svg'
+            page.write_text(self.CLEAN, encoding='utf-8')
+
+            verbose = self._run(page)
+            quiet = self._run(page, '--quiet')
+
+            self.assertEqual(verbose.returncode, quiet.returncode)
+
+            def findings(output: str) -> list[str]:
+                return [
+                    line for line in output.splitlines()
+                    if line.lstrip().startswith(('[ERROR]', '[WARN]'))
+                ]
+
+            self.assertEqual(findings(verbose.stdout), findings(quiet.stdout))
+            self.assertIn('[SUMMARY]', quiet.stdout)
+            # The passing-file line is the noise --quiet exists to remove.
+            self.assertIn('[OK] 01_clean.svg', verbose.stdout)
+            self.assertNotIn('[OK] 01_clean.svg', quiet.stdout)
+            self.assertLess(len(quiet.stdout), len(verbose.stdout))

@@ -1131,6 +1131,12 @@ require an import-style carrier, preview wrapper, fingerprint, or a separate
 source-payload opt-in marker. Exact syntax remains owned by the linked
 standards rather than this pipeline overview.
 
+**`--quiet`**: omits passing-file lines and the repeated `[TIP] Common fixes:` block.
+Every error, warning, `[SUMMARY]` block and `[CARRIERS]` receipt still prints, and the
+exit code is unchanged. It is a convenience for repair-pass re-runs only — **never valid
+at a gate**, where the route runs the checker unfiltered and reviews the complete issue
+set before one consolidated repair pass ([`executor-base.md`](../../references/executor-base.md) §3).
+
 ## `svg_position_calculator.py`
 
 Analyze and review supported chart coordinates after SVG generation.
