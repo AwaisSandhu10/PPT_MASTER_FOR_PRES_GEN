@@ -243,7 +243,7 @@ Read the core as one batch with the exact detail files named by the retained `sp
 |---|---|
 | Fresh, resumed, restarted, compacted, or externally changed context | `design_spec.md`, then `spec_lock.md`, once, plus triggered references and the latest completed SVG when mid-deck ([`failure-recovery.md`](governance/failure-recovery.md)) |
 | Bounded same-context repair that preserves roster/order/identity/communication | Only the affected fragment readback plus `project_manager.py validate` |
-| **Five-page lock re-read** — after P05, P10, P15, … when another page follows | `spec_lock.md` in full once before the next page: a pure re-anchor of palette, typography, icon style, and `page_rhythm` under long context, with no checker run, no output, no pause, and no repair loop; an external change found here follows the recovery branch |
+| **Per-page lock re-anchor** — before each page | `python3 ${SKILL_DIR}/scripts/project_manager.py page-context <project_path> <PNN>` once: the bounded anchor set and current-page delta re-anchor palette, typography, icon style, and `page_rhythm` under long context, with no checker run, no output, no pause, and no repair loop. It replaces the former five-page full `spec_lock.md` re-read. If the projection fails, errors, or omits an anchor the page needs, fall back to reading `spec_lock.md` in full before that page; an external change found either way follows the recovery branch |
 | §X records a literal script | The frozen `notes/total.md` once before P01; design each visible state around its segment |
 | Missing `spec_lock.md` or `design_spec.md` | Stop and report the missing gate artifact; recover through [`failure-recovery.md`](governance/failure-recovery.md) §3; a missing field in an existing lock → its §2 |
 
