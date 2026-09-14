@@ -1061,6 +1061,26 @@ python3 scripts/text_measure.py box "First line" "Second line" --x 96 --y 140 --
 python3 scripts/text_measure.py calibrate projects/example --outline
 ```
 
+## `svg_text_inspect.py`
+
+List every `<text>` node with resolved geometry, style, measured width, and its
+owning container, so a repair pass never reads a whole decorated page.
+
+```bash
+python3 scripts/svg_text_inspect.py <svg-file-or-directory> [--scope <id>] [--json] [--overflowing-only]
+```
+
+Containers follow the checker exactly: an authored page's text is bounded by its
+root `<g>` `data-pptx-bounds` module (measured **with** wrapping headroom) and by
+the root `viewBox` (measured **without** it), reported as `module_overflow` and
+`canvas_overflow`. `data-pptx-frame` is the round-trip route's container and is
+reported separately as `frame`, carrying `inferred: true` when it was resolved
+from the nearest sibling `<rect>` rather than an explicit attribute.
+
+`--scope <id>` limits output to text under one element. `--overflowing-only`
+keeps visible text that fails either container, for a consolidated repair pass.
+The tool is read-only and never rewrites an SVG; the checker remains the gate.
+
 ## `svg_quality_checker.py`
 
 Validate SVG technical compliance.
