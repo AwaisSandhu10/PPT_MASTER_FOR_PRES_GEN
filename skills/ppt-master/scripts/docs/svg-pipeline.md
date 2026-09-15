@@ -1133,9 +1133,10 @@ standards rather than this pipeline overview.
 
 **`--quiet`**: omits passing-file lines and the repeated `[TIP] Common fixes:` block.
 Every error, warning, `[SUMMARY]` block and `[CARRIERS]` receipt still prints, and the
-exit code is unchanged. It is a convenience for repair-pass re-runs only — **never valid
-at a gate**, where the route runs the checker unfiltered and reviews the complete issue
-set before one consolidated repair pass ([`executor-base.md`](../../references/executor-base.md) §3).
+exit code is unchanged. The one permitted call site is a re-verification that closes a
+repair pass before the early gate passes ([`executor-base.md`](../../references/executor-base.md) §3).
+It is **never valid at a gate's own run**, nor on any run writing the exporter-fingerprinted
+`validation/svg_quality_report.json`, where the route reviews the complete issue set unfiltered.
 
 ## `svg_position_calculator.py`
 

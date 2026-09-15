@@ -284,6 +284,10 @@ Mechanical repetition comes from reusing one carrier and topology without a page
   2. **Quality gates**: the gate points and their commands are the route's — [`generate-pptx.md`](../workflows/generate-pptx.md) Step 6 or [`quick-generate.md`](../workflows/profiles/quick-generate.md) §3–4. The repair discipline at every gate is the same: run the checker unfiltered, review the complete issue set, fix every error plus the selected warnings in one consolidated pass, verify once. Never check between individual fixes, never `cat` a passing report, never defer errors past `finalize_svg.py` (it rewrites SVG and masks violations). Every `warning` is advisory.
   3. **Logic Construction Phase (conditional)**: after the gates pass, generate speaker notes for narrative continuity only when the effective Speaker Notes outcome is enabled.
 
+- **Repair readback**: when the issue set names text, list the affected nodes with `python3 ${SKILL_DIR}/scripts/svg_text_inspect.py <project_path> --overflowing-only` (`--scope <id>` for one module, `--json` for full records) instead of reading whole page SVGs. It reports the checker's own containers, tolerances, and severities, is read-only, and never replaces the checker's verdict.
+
+- **Quiet re-verification**: a re-verification run that closes a repair pass before the early gate passes may add `--quiet`, which drops passing-file lines and the repeated fix-tips block and nothing else. A gate's own run, and any run writing the exporter-fingerprinted `validation/svg_quality_report.json`, stays verbatim.
+
 - **Mandatory — final carrier-receipt review**: after the final checker passes, compare its `[CARRIERS]` summary (per-page detail under `files[].info.carrier_receipt`) with the retained page jobs, resource roles, and geometry signatures. Counts are not quotas. Repair only where a fact contradicts an active decision, then rerun the final checker once:
 
   | Contradiction | Repair |
