@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from svg_element_locator import element_path, text_snippet
+
 
 PAGE_ROLE_TO_LAYOUT = {
     "cover": "Cover",
@@ -208,7 +210,9 @@ def validate_semantic_markers(
             if not elem_id:
                 issues.append(SemanticMarkerIssue(
                     "error",
-                    f"<{tag}> with data-pptx-role requires a stable id",
+                    f"<{tag} data-pptx-role={role_raw!r}> at "
+                    f"{element_path(root, elem)}{text_snippet(elem)} "
+                    "requires a stable id; add a unique id attribute",
                 ))
             else:
                 marked_ids.add(elem_id)

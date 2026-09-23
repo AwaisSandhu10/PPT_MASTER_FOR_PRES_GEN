@@ -409,6 +409,60 @@ class SVGQualityCheckerBoundsTests(unittest.TestCase):
                 self.assertEqual(bool(overlap_errors), expects_overlap_error)
 
 
+class ElementLocatorMessageTests(unittest.TestCase):
+    """An id-less element must be findable from its message alone."""
+
+    def test_role_without_id_names_the_role_path_and_text(self) -> None:
+        from svg_to_pptx.semantic_markers import validate_semantic_markers
+
+        root = _parse_svg(
+            '<g id="body" data-pptx-bounds="0 0 500 500"><rect/></g>'
+            '<g data-pptx-role="header"><text>Why Kubernetes</text></g>'
+        )
+        errors = [
+            issue.message
+            for issue in validate_semantic_markers(root)
+            if issue.severity == 'error'
+        ]
+        self.assertEqual(
+            errors,
+            [
+                "<g data-pptx-role='header'> at /svg/g[2] "
+                "(text='Why Kubernetes') requires a stable id; "
+                'add a unique id attribute'
+            ],
+        )
+
+    def test_bounds_on_text_names_the_text_value_and_fix(self) -> None:
+        root = _parse_svg(
+            '<g id="kicker" data-pptx-bounds="80 150 400 30">'
+            '<text x="80" y="170" data-pptx-bounds="80,158,300,20">'
+            'PLATFORM ENGINEERING TEAM</text></g>'
+        )
+        result = _empty_result()
+        SVGQualityChecker()._check_module_bounds_contract(root, result)
+        self.assertIn(
+            "<text> at /svg/g[1]/text[1] (text='PLATFORM ENGINEERING…') "
+            'data-pptx-bounds="80,158,300,20" is valid only on <g> layout '
+            'modules; remove it, only a root <g> module carries bounds',
+            result['errors'],
+        )
+
+    def test_root_group_without_bounds_is_located_when_it_has_no_id(self) -> None:
+        root = _parse_svg(
+            '<g id="motif"><rect width="10" height="10"/></g>'
+            '<g><text x="10" y="20">Control plane</text></g>',
+            'data-pptx-page-role="content"',
+        )
+        result = _empty_result()
+        SVGQualityChecker()._check_module_bounds_contract(root, result)
+        [missing] = [error for error in result['errors'] if 'without explicit' in error]
+        self.assertIn(
+            '(<g id="motif">; <g> at /svg/g[2] (text=\'Control plane\'))',
+            missing,
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
 

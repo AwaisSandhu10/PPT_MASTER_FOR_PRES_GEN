@@ -33,6 +33,7 @@ from pptx_workspace import (
 )
 from slide_roster import discover_slide_svgs
 from svg_authoring_contract import canonical_authoring_errors
+from svg_element_locator import element_locator
 
 from . import svg_contracts
 from .xml_support import (
@@ -4186,8 +4187,10 @@ class SVGQualityChecker:
                 continue
             if _local_name(element) != 'g':
                 result['errors'].append(
-                    f'{_element_label(element)} {_BOUNDS_ATTR} is valid '
-                    'only on <g> layout modules'
+                    f'{element_locator(root, element)} '
+                    f'{_BOUNDS_ATTR}="{element.get(_BOUNDS_ATTR)}" is valid '
+                    'only on <g> layout modules; remove it, only a root <g> '
+                    'module carries bounds'
                 )
 
         for element in root.iter():
@@ -4283,7 +4286,7 @@ class SVGQualityChecker:
                 continue
             raw_bounds = group.get(_BOUNDS_ATTR)
             if raw_bounds is None:
-                missing.append(_element_label(group))
+                missing.append(element_locator(root, group))
                 continue
             try:
                 _parse_positive_bounds(raw_bounds)
