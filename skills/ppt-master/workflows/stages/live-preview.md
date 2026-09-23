@@ -36,6 +36,6 @@ Plain mode, no `--live` (reserved for Step 6). Launch immediately — the user a
 
 1. `python3 ${SKILL_DIR}/scripts/check_annotations.py <project_path>` — its output lists each pending change as `file → element_id → annotation text → content preview`; use it directly as the to-do list. If it reports none, tell the user and stop.
 2. For each annotation: edit the targeted element in `<project_path>/svg_output/<file>` per the text; remove `data-edit-target` and `data-edit-annotation` from it; append one `annotation_applied` JSONL record (`ts`, `file`, `element_id`, original text) to `<project_path>/live_preview/annotations.jsonl`.
-3. Re-enter [`generate-pptx`](../generate-pptx.md) Step 7.2, wait for its success criterion, then run Step 7.3; rerun Step 7.1 only when speaker notes changed.
+3. Re-enter [`generate-pptx`](../generate-pptx.md) Step 7.3; rerun Step 7.1 only when speaker notes changed. Skip Step 7.2 inside the loop: `svg_final/` is a preview export never reads, and its absence never blocks 7.3.
 4. Tell the user, in their language: annotations applied, new PPTX exported, preview still running (refresh or reselect the page if the browser shows the old slide).
-5. More annotations → repeat from 1; "done" or "stop preview" → end.
+5. More annotations → repeat from 1; "done" or "stop preview" → run Step 7.2 once so `svg_final/` matches the delivered SVGs, then end.
