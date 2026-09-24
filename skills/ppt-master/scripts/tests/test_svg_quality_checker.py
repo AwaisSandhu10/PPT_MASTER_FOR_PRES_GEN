@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -457,10 +458,162 @@ class ElementLocatorMessageTests(unittest.TestCase):
         result = _empty_result()
         SVGQualityChecker()._check_module_bounds_contract(root, result)
         [missing] = [error for error in result['errors'] if 'without explicit' in error]
+        self.assertIn('(<g id="motif"> → ', missing)
+        self.assertIn('; <g> at /svg/g[2] (text=\'Control plane\') → ', missing)
+
+
+def _value_after(message: str, marker: str) -> str:
+    """Return the quoted bounds value that follows ``marker``."""
+    return message.split(f'{marker}data-pptx-bounds="', 1)[1].split('"', 1)[0]
+
+
+class BoundsSuggestionTests(unittest.TestCase):
+    """Bounds errors suggest a value that fixes them, without changing what is reported."""
+
+    PAGE = 'data-pptx-page-role="content" font-family="Arial"'
+
+    @staticmethod
+    def _check(root: ET.Element) -> dict:
+        result = _empty_result()
+        checker = SVGQualityChecker()
+        checker._check_module_bounds_contract(root, result)
+        checker._check_text_bounds(root, result)
+        return result
+
+    @staticmethod
+    def _group(root: ET.Element, group_id: str) -> ET.Element:
+        return next(group for group in root if group.get('id') == group_id)
+
+    def _missing(self, root: ET.Element) -> str:
+        [missing] = [e for e in self._check(root)['errors'] if 'without explicit' in e]
+        return missing
+
+    def test_missing_bounds_suggestion_is_the_content_extent_and_clears(self) -> None:
+        root = _parse_svg(
+            '<g id="header"><rect x="80" y="60" width="6" height="40"/>'
+            '<text x="100" y="96" font-size="32">Inside the brain</text>'
+            '<text x="100" y="130" font-size="18">Every command flows here</text></g>',
+            self.PAGE, view_box='0 0 1280 720',
+        )
+        missing = self._missing(root)
+        value = _value_after(missing, '<g id="header"> → ')
+        parents = {id(child): parent for parent in root.iter() for child in parent}
+        left, top, right, bottom = SVGQualityChecker._root_group_content_extent(
+            self._group(root, 'header'), parents, *SVGQualityChecker._text_metric_maps(root),
+        )
+        x, y, width, height = map(float, value.split())
+        self.assertEqual(
+            (x, y, x + width, y + height),
+            (math.floor(left), math.floor(top), math.ceil(right), math.ceil(bottom)),
+        )
+        self.assertNotIn('page decoration', missing)
+        self._group(root, 'header').set('data-pptx-bounds', value)
+        self.assertEqual(self._check(root)['errors'], [])
+
+    def test_shape_only_group_gets_transformed_extent_and_decoration_option(self) -> None:
+        root = _parse_svg(
+            '<g id="motif" transform="translate(100 50)">'
+            '<circle cx="0" cy="0" r="20"/><line x1="0" y1="0" x2="60" y2="0"/></g>',
+            self.PAGE, view_box='0 0 1280 720',
+        )
+        missing = self._missing(root)
+        self.assertIn('<g id="motif"> → data-pptx-bounds="80 30 80 40"', missing)
         self.assertIn(
-            '(<g id="motif">; <g> at /svg/g[2] (text=\'Control plane\'))',
+            'or as page decoration data-pptx-role="decoration" and '
+            'data-pptx-bounds="0 0 1280 720"',
             missing,
         )
+
+    def test_suggestion_names_the_neighbour_it_would_overlap(self) -> None:
+        root = _parse_svg(
+            '<g id="body" data-pptx-bounds="80 100 1120 500">'
+            '<rect x="80" y="100" width="10" height="10"/></g>'
+            '<g id="caption"><text x="100" y="140" font-size="20">Overlapping caption</text></g>',
+            self.PAGE, view_box='0 0 1280 720',
+        )
+        self.assertRegex(
+            self._missing(root),
+            r'<g id="caption"> → data-pptx-bounds="[^"]+" \(overlaps <g id="body">\)',
+        )
+
+    def test_non_positive_bounds_carry_the_content_extent(self) -> None:
+        root = _parse_svg(
+            '<g id="kicker" data-pptx-bounds="160 180 0 34">'
+            '<text x="160" y="202" font-size="14">PLATFORM ENGINEERING</text></g>',
+            self.PAGE, view_box='0 0 1280 720',
+        )
+        [error] = [e for e in self._check(root)['errors'] if 'positive width' in e]
+        value = _value_after(error, '; content extent: ')
+        self._group(root, 'kicker').set('data-pptx-bounds', value)
+        self.assertEqual(self._check(root)['errors'], [])
+
+    def test_off_canvas_bounds_suggest_the_content_extent(self) -> None:
+        root = _parse_svg(
+            '<g id="card" data-pptx-bounds="1000 100 400 100">'
+            '<rect x="1000" y="100" width="200" height="80"/></g>',
+            self.PAGE, view_box='0 0 1280 720',
+        )
+        [error] = [e for e in self._check(root)['errors'] if 'canvas viewBox' in e]
+        self.assertIn('set data-pptx-bounds="1000 100 200 80", its content extent', error)
+
+    def test_text_overflow_gives_one_covering_box_that_clears_every_line(self) -> None:
+        root = _parse_svg(
+            '<g id="header" data-pptx-bounds="80 60 1120 74">'
+            '<text x="80" y="132" font-size="36">Inside the brain</text>'
+            '<text x="80" y="164" font-size="18">Every command flows through here</text></g>',
+            self.PAGE, view_box='0 0 1280 720',
+        )
+        overflow = [e for e in self._check(root)['errors'] if 'exceeds <g id="header">' in e]
+        self.assertEqual(len(overflow), 2, overflow)
+        values = {_value_after(e, 'set its ') for e in overflow}
+        self.assertEqual(len(values), 1, overflow)
+        [value] = values
+        self.assertTrue(value.startswith('80 60 1120 '), value)
+        self._group(root, 'header').set('data-pptx-bounds', value)
+        self.assertEqual(self._check(root)['errors'], [])
+
+    def test_text_overflow_shrinks_an_oversized_box_that_hits_a_neighbour(self) -> None:
+        root = _parse_svg(
+            '<g id="title" data-pptx-bounds="160 270 900 60">'
+            '<text x="160" y="296" font-size="48">Kubernetes,</text></g>'
+            '<g id="art" data-pptx-bounds="860 222 300 300">'
+            '<rect x="860" y="222" width="300" height="300"/></g>',
+            self.PAGE, view_box='0 0 1280 720',
+        )
+        [overflow] = [e for e in self._check(root)['errors'] if 'exceeds <g id="title">' in e]
+        self.assertIn(', its content extent', overflow)
+        self._group(root, 'title').set('data-pptx-bounds', _value_after(overflow, 'set its '))
+        self.assertEqual(self._check(root)['errors'], [])
+
+    def test_text_overflow_without_room_says_what_blocks_it(self) -> None:
+        root = _parse_svg(
+            '<g id="label" data-pptx-bounds="80 100 400 20">'
+            '<text x="80" y="130" font-size="20">A label that sits too low</text></g>'
+            '<g id="below" data-pptx-bounds="80 121 400 100">'
+            '<rect x="80" y="121" width="400" height="100"/></g>',
+            self.PAGE, view_box='0 0 1280 720',
+        )
+        [overflow] = [e for e in self._check(root)['errors'] if 'exceeds <g id="label">' in e]
+        self.assertIn('would overlap <g id="below">; reflow the text or move the neighbour', overflow)
+
+    def test_unmeasurable_content_gets_no_suggestion(self) -> None:
+        root = _parse_svg(
+            '<g id="html"><foreignObject x="0" y="0" width="100" height="50"/></g>',
+            self.PAGE, view_box='0 0 1280 720',
+        )
+        self.assertIn('<g id="html"> → no computable extent', self._missing(root))
+
+    def test_suggestions_do_not_change_what_is_reported(self) -> None:
+        root = _parse_svg(
+            '<g id="header"><text x="80" y="96" font-size="32">Title</text></g>'
+            '<g id="body" data-pptx-bounds="80 120 1120 0"/>',
+            self.PAGE, view_box='0 0 1280 720',
+        )
+        with patch.object(checker_module, '_shape_local_bbox', None):
+            plain = self._check(root)
+        suggested = self._check(root)
+        self.assertEqual(len(plain['errors']), len(suggested['errors']))
+        self.assertEqual(len(plain['warnings']), len(suggested['warnings']))
 
 
 if __name__ == '__main__':

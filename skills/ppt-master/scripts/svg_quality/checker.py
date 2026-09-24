@@ -228,6 +228,13 @@ except ImportError:
     _validate_native_object_marker = None
 
 try:
+    from svg_to_pptx.native_objects.marker_common import (
+        _element_local_bbox as _shape_local_bbox,
+    )
+except ImportError:
+    _shape_local_bbox = None
+
+try:
     from svg_to_pptx.native_objects import (
         validate_native_object_marker_with_warnings as _validate_native_object_marker_with_warnings,
     )
@@ -405,6 +412,14 @@ _NON_VISUAL_SVG_TAGS = frozenset({
     'title',
 })
 _BOUNDS_ATTR = 'data-pptx-bounds'
+_EXTENT_SHAPE_TAGS = frozenset({
+    'circle', 'ellipse', 'image', 'line', 'path',
+    'polygon', 'polyline', 'rect', 'use',
+})
+_EXTENT_UNRENDERED_TAGS = frozenset({
+    'clipPath', 'filter', 'linearGradient', 'marker', 'mask',
+    'pattern', 'radialGradient', 'symbol',
+})
 _MORPH_STAGING_ATTR = 'data-pptx-morph-staging'
 _BOUNDS_OVERFLOW_TOLERANCE = 1.0
 _BOUNDS_OVERFLOW_ERROR_RATIO = 0.05
@@ -3801,6 +3816,185 @@ class SVGQualityChecker:
         return _BOUNDS_ATTR, (x, y, x + width, y + height)
 
     @staticmethod
+    def _text_metric_maps(
+        root: ET.Element,
+    ) -> Tuple[Dict[int, float], Dict[int, float]] | None:
+        """Resolve the font-size and letter-spacing maps text estimates need."""
+        helpers = (
+            _estimate_single_line_text_frame_width,
+            _parse_project_font_weight,
+            _parse_project_geometry_length,
+            _parse_project_text_anchor,
+            _resolve_project_font_sizes,
+            _resolve_project_letter_spacings,
+        )
+        if any(helper is None for helper in helpers):
+            return None
+        try:
+            font_sizes = _resolve_project_font_sizes(root)
+            return font_sizes, _resolve_project_letter_spacings(root, font_sizes)
+        except ValueError:
+            return None
+
+    @classmethod
+    def _root_group_content_extent(
+        cls,
+        group: ET.Element,
+        parent_by_id: Dict[int, ET.Element],
+        font_sizes: Dict[int, float],
+        letter_spacings: Dict[int, float],
+    ) -> Tuple[float, float, float, float] | None:
+        """Return the box around all the group's content, or None if any part can't be measured."""
+        if _shape_local_bbox is None:
+            return None
+        boxes: List[Tuple[float, float, float, float]] = []
+
+        def visit(element: ET.Element) -> bool:
+            tag = _local_name(element)
+            if tag in _NON_VISUAL_SVG_TAGS or tag in _EXTENT_UNRENDERED_TAGS:
+                return True
+            if cls._is_hidden_element(element, parent_by_id):
+                return True
+            if tag in {'g', 'a'}:
+                return all(visit(child) for child in list(element))
+            if tag == 'text':
+                visible = ''.join(element.itertext())
+                if not visible.strip() or ('{{' in visible and '}}' in visible):
+                    return True
+                box = cls._estimated_text_bounds(
+                    element,
+                    parent_by_id,
+                    font_sizes,
+                    letter_spacings,
+                    include_headroom=True,
+                )
+            elif tag in _EXTENT_SHAPE_TAGS:
+                try:
+                    local = _shape_local_bbox(element)
+                except (RuntimeError, ValueError):
+                    return False
+                if local is None:
+                    return True
+                left, top, right, bottom = local
+                box = cls._transformed_rect_bounds(
+                    element,
+                    (left, top, right - left, bottom - top),
+                    parent_by_id,
+                )
+            else:
+                return False
+            if box is None:
+                return False
+            boxes.append(box)
+            return True
+
+        if not visit(group) or not boxes:
+            return None
+        return (
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        )
+
+    @staticmethod
+    def _suggested_bounds(
+        extent: Tuple[float, float, float, float],
+        canvas: Tuple[float, float, float, float] | None,
+    ) -> Tuple[Tuple[float, float, float, float], bool] | None:
+        """Round an extent outward to whole pixels and clamp it to the canvas."""
+        rounded = (
+            math.floor(extent[0]),
+            math.floor(extent[1]),
+            math.ceil(extent[2]),
+            math.ceil(extent[3]),
+        )
+        rect = rounded
+        if canvas is not None:
+            rect = (
+                max(rounded[0], canvas[0]),
+                max(rounded[1], canvas[1]),
+                min(rounded[2], canvas[2]),
+                min(rounded[3], canvas[3]),
+            )
+        if rect[2] <= rect[0] or rect[3] <= rect[1]:
+            return None
+        return rect, rect != rounded
+
+    @staticmethod
+    def _format_bounds(rect: Tuple[float, float, float, float]) -> str:
+        left, top, right, bottom = rect
+        return f'{left:g} {top:g} {right - left:g} {bottom - top:g}'
+
+    @classmethod
+    def _overlap_candidates(
+        cls,
+        root: ET.Element,
+        parent_by_id: Dict[int, ET.Element],
+        canvas: Tuple[float, float, float, float] | None,
+    ) -> List[Tuple[ET.Element, Tuple[float, float, float, float]]]:
+        """Return visible root groups with valid bounds that the overlap rule covers."""
+        structured_page = all(
+            (root.get(attribute) or '').strip()
+            for attribute in _PPTX_ROOT_STRUCTURE_ATTRS
+        )
+        candidates = []
+        for group in list(root):
+            if _local_name(group) != 'g':
+                continue
+            if cls._is_hidden_element(group, parent_by_id):
+                continue
+            if cls._root_module_overlap_exempt(
+                group,
+                structured_page=structured_page,
+                canvas=canvas,
+            ):
+                continue
+            resolved = cls._resolved_root_module_bounds(group)
+            if resolved is not None:
+                candidates.append((group, resolved[1]))
+        return candidates
+
+    @classmethod
+    def _bounds_suggestion(
+        cls,
+        group: ET.Element,
+        extent: Tuple[float, float, float, float] | None,
+        canvas: Tuple[float, float, float, float] | None,
+        candidates: List[Tuple[ET.Element, Tuple[float, float, float, float]]],
+        *,
+        overlap_exempt: bool,
+    ) -> Tuple[str, List[str], bool] | None:
+        """Return the suggested bounds value, overlapped neighbours and clamp flag."""
+        if extent is None:
+            return None
+        suggested = cls._suggested_bounds(extent, canvas)
+        if suggested is None:
+            return None
+        rect, clamped = suggested
+        overlaps = [] if overlap_exempt else [
+            _element_label(other)
+            for other, bounds in candidates
+            if other is not group
+            and all(
+                length > _BOUNDS_OVERFLOW_TOLERANCE
+                for length in cls._bounds_overlap_dimensions(rect, bounds)
+            )
+        ]
+        return f'{_BOUNDS_ATTR}="{cls._format_bounds(rect)}"', overlaps, clamped
+
+    @staticmethod
+    def _suggestion_caveats(overlaps: List[str], clamped: bool) -> str:
+        notes = []
+        if overlaps:
+            named = ', '.join(overlaps[:2])
+            more = f' +{len(overlaps) - 2} more' if len(overlaps) > 2 else ''
+            notes.append(f'overlaps {named}{more}')
+        if clamped:
+            notes.append('clamped to the canvas')
+        return f' ({"; ".join(notes)})' if notes else ''
+
+    @staticmethod
     def _bounds_overflow_metrics(
         inner: Tuple[float, float, float, float],
         outer: Tuple[float, float, float, float],
@@ -4259,7 +4453,7 @@ class SVGQualityChecker:
                     'viewBox or remove the marker from partially visible content'
                 )
 
-        missing: List[str] = []
+        missing: List[ET.Element] = []
         bounded_root_groups: List[
             Tuple[ET.Element, Tuple[float, float, float, float]]
         ] = []
@@ -4268,6 +4462,38 @@ class SVGQualityChecker:
             for child in list(root)
             if _local_name(child) == 'g'
         ]
+        structured_page = all(
+            (root.get(attribute) or '').strip()
+            for attribute in _PPTX_ROOT_STRUCTURE_ATTRS
+        )
+        metrics = self._text_metric_maps(root)
+        overlap_candidates = self._overlap_candidates(root, parent_by_id, canvas)
+
+        def content_extent(group: ET.Element):
+            if metrics is None:
+                return None
+            return self._root_group_content_extent(group, parent_by_id, *metrics)
+
+        def overlap_exempt(group: ET.Element) -> bool:
+            return self._root_module_overlap_exempt(
+                group,
+                structured_page=structured_page,
+                canvas=canvas,
+            )
+
+        def extent_note(group: ET.Element) -> str | None:
+            suggestion = self._bounds_suggestion(
+                group,
+                content_extent(group),
+                canvas,
+                overlap_candidates,
+                overlap_exempt=overlap_exempt(group),
+            )
+            if suggestion is None:
+                return None
+            value, overlaps, clamped = suggestion
+            return f'{value}{self._suggestion_caveats(overlaps, clamped)}'
+
         require_bounds = (
             self.template_mode
             or root.get('data-pptx-page-role') is not None
@@ -4286,13 +4512,15 @@ class SVGQualityChecker:
                 continue
             raw_bounds = group.get(_BOUNDS_ATTR)
             if raw_bounds is None:
-                missing.append(element_locator(root, group))
+                missing.append(group)
                 continue
             try:
                 _parse_positive_bounds(raw_bounds)
             except ValueError as exc:
+                note = extent_note(group)
                 result['errors'].append(
                     f'{_element_label(group)} {_BOUNDS_ATTR} {exc}'
+                    + (f'; content extent: {note}' if note else '')
                 )
                 continue
 
@@ -4305,6 +4533,9 @@ class SVGQualityChecker:
             if self._is_off_canvas_morph_group(group, canvas):
                 continue
             attribute, bounds = resolved
+            if self._bounds_overflow_metrics(bounds, canvas) is None:
+                continue
+            note = extent_note(group)
             self._record_bounds_overflow(
                 result,
                 subject=f'{_element_label(group)} {attribute}',
@@ -4312,14 +4543,12 @@ class SVGQualityChecker:
                 container='canvas viewBox',
                 outer=canvas,
                 repair=(
-                    'keep the root module subcanvas inside the SVG viewBox'
+                    f'set {note}, its content extent'
+                    if note
+                    else 'keep the root module subcanvas inside the SVG viewBox'
                 ),
             )
 
-        structured_page = all(
-            (root.get(attribute) or '').strip()
-            for attribute in _PPTX_ROOT_STRUCTURE_ATTRS
-        )
         for index, (first_group, first_bounds) in enumerate(
             bounded_root_groups,
         ):
@@ -4354,16 +4583,58 @@ class SVGQualityChecker:
                 )
 
         if missing:
-            sample = '; '.join(missing[:3])
-            suffix = '' if len(missing) <= 3 else f'; +{len(missing) - 3} more'
+            def decoration_candidate(group: ET.Element) -> bool:
+                role = (group.get('data-pptx-role') or '').strip().lower()
+                return canvas is not None and role not in _STRUCTURAL_ROLES and not any(
+                    ''.join(text.itertext()).strip()
+                    for text in group.iter(f'{{{SVG_NS}}}text')
+                )
+
+            # Check suggestions against each other, but skip groups that may become decoration.
+            neighbours = list(overlap_candidates)
+            for group in missing:
+                if overlap_exempt(group) or decoration_candidate(group):
+                    continue
+                extent = content_extent(group)
+                suggested = (
+                    None if extent is None
+                    else self._suggested_bounds(extent, canvas)
+                )
+                if suggested is not None:
+                    neighbours.append((group, suggested[0]))
+            entries = []
+            for group in missing:
+                locator = element_locator(root, group)
+                if metrics is None:
+                    entries.append(locator)
+                    continue
+                suggestion = self._bounds_suggestion(
+                    group,
+                    content_extent(group),
+                    canvas,
+                    neighbours,
+                    overlap_exempt=overlap_exempt(group),
+                )
+                if suggestion is None:
+                    entries.append(f'{locator} → no computable extent')
+                    continue
+                value, overlaps, clamped = suggestion
+                entry = f'{locator} → {value}{self._suggestion_caveats(overlaps, clamped)}'
+                if decoration_candidate(group):
+                    needs_id = '' if (group.get('id') or '').strip() else ' plus an id'
+                    entry += (
+                        ', or as page decoration data-pptx-role="decoration"'
+                        f'{needs_id} and {_BOUNDS_ATTR}="{self._format_bounds(canvas)}"'
+                    )
+                entries.append(entry)
             bucket = result['errors'] if require_bounds else result['warnings']
             prefix = 'Detected' if require_bounds else 'Reference SVG: detected'
             bucket.append(
                 f'{prefix} {len(missing)} visible root-level <g> '
                 f'module(s) without explicit {_BOUNDS_ATTR} '
-                f'({sample}{suffix}); every final-page/template root <g> other '
-                'than a compact authored-preset atom declares its root-coordinate '
-                'layout subcanvas even when it also carries native coordinates'
+                f'({"; ".join(entries)}); every final-page/template root <g> '
+                'other than a compact authored-preset atom declares its '
+                'root-coordinate layout subcanvas'
             )
 
     def _check_text_bounds(
@@ -4374,24 +4645,10 @@ class SVGQualityChecker:
         included_text_ids: set[int] | None = None,
     ) -> None:
         """Validate visible text against page and root-module bounds."""
-        helpers = (
-            _estimate_single_line_text_frame_width,
-            _parse_project_font_weight,
-            _parse_project_geometry_length,
-            _parse_project_text_anchor,
-            _resolve_project_font_sizes,
-            _resolve_project_letter_spacings,
-        )
-        if any(helper is None for helper in helpers):
+        metrics = self._text_metric_maps(root)
+        if metrics is None:
             return
-        try:
-            font_sizes = _resolve_project_font_sizes(root)
-            letter_spacings = _resolve_project_letter_spacings(
-                root,
-                font_sizes,
-            )
-        except ValueError:
-            return
+        font_sizes, letter_spacings = metrics
 
         parent_by_id = {
             id(child): parent
@@ -4514,6 +4771,11 @@ class SVGQualityChecker:
             for child in list(root)
             if _local_name(child) == 'g'
         ]
+        structured_page = all(
+            (root.get(attribute) or '').strip()
+            for attribute in _PPTX_ROOT_STRUCTURE_ATTRS
+        )
+        overlap_candidates = self._overlap_candidates(root, parent_by_id, canvas)
         for module in root_groups:
             if self._is_hidden_element(module, parent_by_id):
                 continue
@@ -4521,6 +4783,33 @@ class SVGQualityChecker:
             if resolved_module is None:
                 continue
             boundary_attribute, boundary = resolved_module
+            overflowing = any(
+                estimated_by_id.get(id(text_element)) is not None
+                and id(text_element) not in page_overflow_text_ids
+                and self._bounds_overflow_metrics(
+                    estimated_by_id[id(text_element)],
+                    boundary,
+                ) is not None
+                for text_element in module.iter(f'{{{SVG_NS}}}text')
+            )
+            repair = (
+                self._covering_bounds_repair(
+                    module,
+                    boundary,
+                    parent_by_id,
+                    font_sizes,
+                    letter_spacings,
+                    canvas,
+                    overlap_candidates,
+                    overlap_exempt=self._root_module_overlap_exempt(
+                        module,
+                        structured_page=structured_page,
+                        canvas=canvas,
+                    ),
+                )
+                if overflowing
+                else ''
+            )
             for text_element in module.iter(f'{{{SVG_NS}}}text'):
                 if id(text_element) in page_overflow_text_ids:
                     continue
@@ -4535,10 +4824,7 @@ class SVGQualityChecker:
                         f'{_element_label(module)} {boundary_attribute}'
                     ),
                     outer=boundary,
-                    repair=(
-                        'expand the root module bounds into available '
-                        'non-overlapping space; otherwise reflow the text'
-                    ),
+                    repair=repair,
                     width_diagnostic=self._text_width_diagnostic(
                         text_element,
                         parent_by_id,
@@ -4548,6 +4834,68 @@ class SVGQualityChecker:
                         include_headroom=True,
                     ),
                 )
+
+    @classmethod
+    def _covering_bounds_repair(
+        cls,
+        module: ET.Element,
+        boundary: Tuple[float, float, float, float],
+        parent_by_id: Dict[int, ET.Element],
+        font_sizes: Dict[int, float],
+        letter_spacings: Dict[int, float],
+        canvas: Tuple[float, float, float, float] | None,
+        overlap_candidates: List[Tuple[ET.Element, Tuple[float, float, float, float]]],
+        *,
+        overlap_exempt: bool,
+    ) -> str:
+        """Suggest bounds that fit all the group's content, or say what blocks them."""
+        extent = cls._root_group_content_extent(
+            module,
+            parent_by_id,
+            font_sizes,
+            letter_spacings,
+        )
+        if extent is None:
+            return (
+                'expand the root module bounds into available '
+                'non-overlapping space; otherwise reflow the text'
+            )
+        covering = (
+            min(extent[0], boundary[0]),
+            min(extent[1], boundary[1]),
+            max(extent[2], boundary[2]),
+            max(extent[3], boundary[3]),
+        )
+        suggestion = cls._bounds_suggestion(
+            module,
+            covering,
+            canvas,
+            overlap_candidates,
+            overlap_exempt=overlap_exempt,
+        )
+        if suggestion is None:
+            return 'reflow the text; its content leaves the canvas'
+        value, overlaps, clamped = suggestion
+        if not overlaps and not clamped:
+            return f'set its {value}, which covers all its content'
+        # If the declared box is too big, shrinking to the content may avoid the overlap.
+        shrunk = cls._bounds_suggestion(
+            module,
+            extent,
+            canvas,
+            overlap_candidates,
+            overlap_exempt=overlap_exempt,
+        )
+        if shrunk is not None and not shrunk[1] and not shrunk[2]:
+            return f'set its {shrunk[0]}, its content extent'
+        conflict = ' and '.join(
+            ([f'overlap {", ".join(overlaps)}'] if overlaps else [])
+            + (['leave the canvas'] if clamped else [])
+        )
+        return (
+            f'bounds covering all its content ({value}) would {conflict}; '
+            'reflow the text or move the neighbour'
+        )
 
     def _check_unmergeable_leading_text(self, root: ET.Element, result: Dict) -> None:
         """Warn when leading text cannot be normalized into one PPT text frame."""
