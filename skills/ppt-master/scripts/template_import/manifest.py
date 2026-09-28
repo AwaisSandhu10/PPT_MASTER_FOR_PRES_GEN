@@ -332,14 +332,15 @@ def _placeholder_content_state(node) -> str:
     return "empty"
 
 
-def _geometry_record(xfrm) -> dict[str, int] | None:
+def _geometry_record(xfrm) -> dict[str, float] | None:
     if xfrm is None or xfrm.w <= 0 or xfrm.h <= 0:
         return None
+    # Unrounded px: rounding a sub-pixel size to 0 breaks the positive-size contract.
     return {
-        "x": int(round(xfrm.x)),
-        "y": int(round(xfrm.y)),
-        "width": int(round(xfrm.w)),
-        "height": int(round(xfrm.h)),
+        "x": float(xfrm.x),
+        "y": float(xfrm.y),
+        "width": float(xfrm.w),
+        "height": float(xfrm.h),
     }
 
 

@@ -7,13 +7,17 @@ Fixtures are built inside the test; nothing here depends on a sample deck.
 
 from __future__ import annotations
 
+import math
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from xml.etree import ElementTree as ET
 
 import mirror_template_materialize as M
-from svg_to_pptx.pptx_package.template_structure import parse_template_slides
+from svg_to_pptx.pptx_package.template_structure import (
+    _native_geometry as _contract_geometry,
+    parse_template_slides,
+)
 from template_import.manifest import (
     UnsupportedPlaceholderHostError,
     extract_placeholders,
@@ -104,6 +108,16 @@ def _by_idx(records, idx):
     return next(item for item in records if item["idx"] == idx)
 
 
+def _sized_sp(shape_id: str, ph_type: str, idx: str, cx: int, cy: int) -> str:
+    return (
+        f"<p:sp><p:nvSpPr>"
+        f'<p:cNvPr id="{shape_id}" name="Shape {shape_id}" hidden="1"/>'
+        f"<p:cNvSpPr/><p:nvPr>{_ph(ph_type, idx)}</p:nvPr></p:nvSpPr>"
+        f"<p:spPr>{_xfrm(x=11461618, y=747744, cx=cx, cy=cy)}</p:spPr>"
+        f"<p:txBody><a:bodyPr/><a:p/></p:txBody></p:sp>"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Import: every host element, both content states
 # ---------------------------------------------------------------------------
@@ -176,6 +190,41 @@ class ImportPlaceholderHostTests(unittest.TestCase):
             f'{_sp("21", "body", "7", text="nested")}</p:grpSp>'
         )
         self.assertEqual(len(extract_placeholders(_part(grp))), 1)
+
+
+class ImportGeometryPrecisionTests(unittest.TestCase):
+    """A shrunk, hidden footer (636/856 EMU tall) keeps a positive size."""
+
+    SIZES = (("10", 54850, 636, 0.0668), ("11", 73853, 856, 0.0899))
+
+    def _records(self, cy_override: int | None = None):
+        shapes = [
+            _sized_sp(str(8 + n), "ftr", idx, cx, cy if cy_override is None else cy_override)
+            for n, (idx, cx, cy, _) in enumerate(self.SIZES)
+        ]
+        return extract_placeholders(_part(*shapes, tag="sldLayout"))
+
+    def test_sub_pixel_sizes_stay_finite_positive_floats(self):
+        records = self._records()
+        for idx, cx, cy, height_px in self.SIZES:
+            geometry = _by_idx(records, idx)["geometry"]
+            for key in ("x", "y", "width", "height"):
+                self.assertIsInstance(geometry[key], float)
+                self.assertTrue(math.isfinite(geometry[key]))
+            self.assertGreater(geometry["height"], 0)
+            self.assertAlmostEqual(geometry["height"], cy / 9525)
+            self.assertAlmostEqual(geometry["height"], height_px, places=4)
+            self.assertAlmostEqual(geometry["width"], cx / 9525)
+
+    def test_native_structure_contract_accepts_sub_pixel_geometry(self):
+        for idx, _, _, _ in self.SIZES:
+            geometry = _by_idx(self._records(), idx)["geometry"]
+            values = _contract_geometry(geometry, f"placeholder {idx}")
+            self.assertGreater(values[3], 0)
+
+    def test_zero_size_still_records_no_geometry(self):
+        for idx, _, _, _ in self.SIZES:
+            self.assertIsNone(_by_idx(self._records(cy_override=0), idx)["geometry"])
 
 
 class ImportTypeResolutionTests(unittest.TestCase):
